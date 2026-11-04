@@ -1,0 +1,737 @@
+/**
+ * 他部門稼働 申請・承認・成果報告（職務権限 No.43）プロトタイプ
+ * 設計書「他部門稼働申請 要件定義・設計書（最低限版）」に対応
+ *
+ * 構成
+ *   申請フォーム     → シート「申請回答」（右側に管理列を足し、承認はこのシートのプルダウンで行う）
+ *   成果報告フォーム → シート「成果回答」
+ *   通知はChatwork。トークン未登録の間は、投稿する内容を実行ログに出すだけ（試運転用）
+ *
+ * 初回の手順
+ *   1. 申請フォームと成果報告フォームを手で作り、回答先をこのスプレッドシートにする
+ *      （設問名は下の F と R の文言どおり。メールアドレスの収集は「確認済み」）
+ *   2. 回答シートの名前を「申請回答」「成果回答」に変更する
+ *   3. Chatworkを使うときは、スクリプト プロパティに CHATWORK_TOKEN と CHATWORK_ROOM_ID を登録
+ *      （任意）CHATWORK_TO にアカウントIDを入れると、全通知の先頭にその人あてのTOが付く（テスト用）
+ *      アカウントIDは listChatworkMembers を実行すると実行ログに出る
+ *   4. setup を実行
+ */
+
+// ===== 設定 =====
+const CONFIG = {
+  // この時間「以下」の申請は承認不要（届出のみ）。0 なら全件で承認が必要
+  NO_APPROVAL_MAX_HOURS: 0,
+  // 稼働終了日から何日たっても成果が未入力なら督促するか
+  REMIND_AFTER_DAYS: 3,
+  // 督促を送る時刻（時）
+  REMIND_HOUR: 9,
+  // 申請回答シートで、承認列のプルダウンと保護を用意しておく行数
+  PREPARED_ROWS: 2000,
+  TIMEZONE: 'Asia/Tokyo',
+  SHEET_APPLY: '申請回答',
+  SHEET_RESULT: '成果回答',
+};
+
+// 部長の一覧（通知のメンション先）
+//   dept      ：申請フォームの選択肢の部門名（選択肢が「営業部（冨田）」なら「営業部」）
+//   name      ：通知に表示する名前
+//   accountId ：ChatworkのアカウントID（数字）。プロフィールの「チャットワークID」（英数字）とは別物
+//               調べ方：その部長がいるグループの入力欄で「TO」から本人を選ぶと、[To:1234567] の数字が出る
+//   accountId が空の部長には、メンションを付けずに名前だけで通知する
+//   テスト中は accountId に自分の番号を入れておくと、すべてのメンションが自分に届く
+const MANAGERS = [
+  { dept: '営業部', name: '佐藤', accountId: '11419645' },
+  { dept: '制作部', name: '栗山', accountId: '11419645' },
+  { dept: '管理部', name: '輿石', accountId: '11419645' }
+];
+
+// ===== 通知の文面（ここの日本語を書き換えれば、Chatworkの文面が変わる） =====
+//   ・` と ` の間は自由に書き換えられる。改行もそのまま反映される（行頭の空白も文面に入る）
+//   ・{ } で囲んだ部分には、申請の内容が自動で入る。使えるものは下の一覧のとおり
+//   ・先頭のメンション（[To:ID]名前さん）と、枠（[info]）・見出し（[title]）は自動で付く
+//   ・文中に ` （バッククォート）は書けない
+//   使える差し込み：
+//     {管理ID} {申請部門} {申請部長} {稼働先部門} {稼働先部長} {稼働メンバー}
+//     {開始日} {終了日} {予定時間} {目的} {概要}
+//     {承認者} {却下理由} {実績時間} {成果内容} {成果報告URL}
+//     {シートのリンク}（承認依頼と、督促の承認待ちの行だけ）
+//     {件数}（督促の見出しだけ）　{再提出} {注意書き}（成果報告だけ）
+const MESSAGES = {
+  // すべての通知に入る共通の数行。{概要} と書いた場所に入る
+  '概要': `申請：{申請部門}　{申請部長}
+稼働メンバー：{稼働メンバー}（{稼働先部門}）
+期間：{開始日}〜{終了日}（予定{予定時間}時間）`,
+
+  // 申請が届いたとき（稼働先の部長あて）
+  '承認依頼': {
+    'タイトル': '【承認依頼】他部門稼働 {管理ID}',
+    '本文': `{稼働先部長}、承認をお願いします。
+
+{概要}
+目的：{目的}
+
+▼シートの「承認ステータス」で「承認」か「却下」を選んでください（却下のときは先に「却下理由」を記入）
+{シートのリンク}`,
+  },
+
+  // 承認不要の届出のとき（稼働先の部長と申請した部長あて）
+  '承認不要': {
+    'タイトル': '【稼働のお知らせ】他部門稼働 {管理ID}（権限内のため承認不要）',
+    '本文': `{稼働先部長}へ：{稼働メンバー}さんの稼働の届出です。
+
+{概要}
+目的：{目的}
+
+▼稼働後の成果報告フォーム（{申請部長}）
+{成果報告URL}`,
+  },
+
+  // 承認されたとき（申請した部長あて）
+  '承認': {
+    'タイトル': '【承認】他部門稼働 {管理ID}',
+    '本文': `{申請部長}、{稼働メンバー}さんの稼働が承認されました。
+
+{概要}
+承認者：{承認者}
+
+▼稼働後の成果報告フォーム（管理IDは入力済み）
+{成果報告URL}`,
+  },
+
+  // 却下されたとき（申請した部長あて）
+  '却下': {
+    'タイトル': '【却下】他部門稼働 {管理ID}',
+    '本文': `{申請部長}、申請は却下されました。
+
+{概要}
+却下理由：{却下理由}
+対応者：{承認者}`,
+  },
+
+  // 成果報告が届いたとき（稼働先の部長あて）
+  // {再提出} は2回目以降の報告のときだけ「（再提出）」になる
+  // {注意書き} は承認されていない申請への報告のときだけ、注意の1行になる
+  '成果報告': {
+    'タイトル': '【成果報告{再提出}】他部門稼働 {管理ID}',
+    '本文': `{稼働先部長}、{稼働メンバー}さんの稼働成果の報告です。{注意書き}
+
+{概要}
+実績：{実績時間}時間
+成果：
+{成果内容}`,
+  },
+
+  // 毎朝の督促（承認待ちの案件は稼働先の部長、成果未入力の案件は申請した部長あて）
+  // 「行」は1件ごとに繰り返される
+   // 毎朝の督促（稼働終了から日数がたっても成果報告がないものだけ。申請した部長あてにメンション）
+  // 「行」は1件ごとに繰り返される
+  '督促': {
+    'タイトル': '【督促】成果報告がまだの他部門稼働（{件数}件）',
+    '前置き': '稼働終了から日数がたっていますが、成果報告が届いていません。下のリンクから報告をお願いします。',
+    '行': `・{管理ID}　{申請部長}：{稼働メンバー}（{稼働先部門}）稼働終了 {終了日}
+　　　{成果報告URL}`,
+  },
+};
+
+// 申請フォームの設問（＝申請回答シートの見出し）
+const F = {
+  TIMESTAMP: 'タイムスタンプ',
+  EMAIL: 'メールアドレス',
+  APPLY_DEPT: '申請部門',
+  MEMBER: '稼働させたいメンバー',
+  TARGET_DEPT: '稼働メンバーの所属部門',
+  START: '稼働開始日',
+  END: '稼働終了日',
+  HOURS: '予定時間',
+  PURPOSE: '目的・期待する成果',
+};
+
+// 申請回答シートの右側に足す管理列（この順で追加する）
+const M = {
+  ID: '管理ID',
+  STATUS: '承認ステータス',
+  REASON: '却下理由',
+  APPROVER: '承認者',
+  APPROVED_AT: '承認日時',
+  RESULT_STATUS: '成果入力ステータス',
+  ACTUAL: '実績時間',
+  RESULT: '成果内容',
+  REPORTED_AT: '成果報告日時',
+};
+const M_ORDER = [M.ID, M.STATUS, M.REASON, M.APPROVER, M.APPROVED_AT, M.RESULT_STATUS, M.ACTUAL, M.RESULT, M.REPORTED_AT];
+
+// 成果報告フォームの設問（＝成果回答シートの見出し）
+const R = {
+  EMAIL: 'メールアドレス',
+  ID: '管理ID',
+  ACTUAL: '実績時間',
+  RESULT: '成果内容',
+};
+
+const S = { PENDING: '申請中', APPROVED: '承認', REJECTED: '却下', NOT_REQUIRED: '承認不要' };
+const RS = { NONE: '未入力', DONE: '入力完了' };
+const ID_MARK = 'ZZIDZZ';
+
+
+// ===== トリガー：フォーム送信時 =====
+function handleFormSubmit(e) {
+  const sheet = e.range.getSheet();
+  const name = sheet.getName();
+  if (name !== CONFIG.SHEET_APPLY && name !== CONFIG.SHEET_RESULT) return;
+  // 送信トリガーが二重に動くことがあるため、同じ行は一度だけ処理する
+  if (!firstTime_('submit:' + name + ':' + e.range.getRow())) return;
+  if (name === CONFIG.SHEET_APPLY) onApplication_(sheet, e.range.getRow());
+  else onResult_(sheet, e.range.getRow());
+}
+
+// F2・F3：管理IDと初期値を入れ、承認依頼を投稿
+function onApplication_(sheet, row) {
+  const cols = columns_(sheet);
+  requireCols_(cols, Object.values(F).concat(M_ORDER));
+  const rec = withLock_(() => {
+    const r = readRow_(sheet, cols, row);
+    if (r[M.ID]) return null; // 採番済み
+    const hours = Number(r[F.HOURS]);
+    const status = hours <= CONFIG.NO_APPROVAL_MAX_HOURS ? S.NOT_REQUIRED : S.PENDING;
+    const id = nextId_();
+    writeRow_(sheet, cols, row, { [M.ID]: id, [M.STATUS]: status, [M.RESULT_STATUS]: RS.NONE });
+    setStatus_(id, status);
+    return readRow_(sheet, cols, row);
+  });
+  if (!rec) return;
+  postChatwork_(rec[M.STATUS] === S.PENDING
+    ? approvalRequestMessage_(rec, rowLink_(sheet, row, cols[M.STATUS]))
+    : noApprovalMessage_(rec));
+}
+
+// F7・F8：成果を申請回答シートに転記し、共有
+function onResult_(resultSheet, row) {
+  const rcols = columns_(resultSheet);
+  requireCols_(rcols, Object.values(R));
+  const r = readRow_(resultSheet, rcols, row);
+  const id = String(r[R.ID] || '').trim();
+  const apply = applySheet_();
+  const cols = columns_(apply);
+
+  const out = withLock_(() => {
+    const target = findRowById_(apply, cols, id);
+    if (!target) return null;
+    const again = readRow_(apply, cols, target)[M.RESULT_STATUS] === RS.DONE;
+    writeRow_(apply, cols, target, {
+      [M.ACTUAL]: Number(r[R.ACTUAL]),
+      [M.RESULT]: String(r[R.RESULT] || '').trim(),
+      [M.REPORTED_AT]: new Date(),
+      [M.RESULT_STATUS]: RS.DONE,
+    });
+    return { rec: readRow_(apply, cols, target), again: again };
+  });
+
+  if (!out) {
+    postChatwork_(`[info][title]【要確認】成果報告の管理IDが見つかりません[/title]` +
+      `管理ID：${id || '（空欄）'}\n報告者：${r[R.EMAIL] || '不明'}\n` +
+      `「${CONFIG.SHEET_RESULT}」シートの内容を確認してください。[/info]`);
+    return;
+  }
+  postChatwork_(resultMessage_(out.rec, out.again));
+}
+
+
+// ===== トリガー：編集時（F4〜F6） =====
+function handleEdit(e) {
+  const range = e.range;
+  const sheet = range.getSheet();
+  if (sheet.getName() !== CONFIG.SHEET_APPLY) return;
+  const cols = columns_(sheet);
+  const sc = cols[M.STATUS];
+  if (!sc || sc < range.getColumn() || sc > range.getLastColumn()) return;
+  const firstRow = Math.max(2, range.getRow());
+  const lastRow = range.getLastRow();
+  if (lastRow < firstRow) return;
+
+  const editor = String((e.user && e.user.getEmail && e.user.getEmail()) || '').trim();
+  const bulk = range.getNumRows() > 1 || range.getNumColumns() > 1;
+
+  const message = withLock_(() => bulk
+    ? bulkEdit_(sheet, cols, firstRow, lastRow, editor)
+    : statusEdit_(sheet, cols, firstRow, editor));
+  if (message) postChatwork_(message);
+}
+
+// 1セルの変更：承認・却下を記録するか、無効なら元に戻す
+function statusEdit_(sheet, cols, row, editor) {
+  const rec = readRow_(sheet, cols, row);
+  const id = rec[M.ID];
+  const value = String(rec[M.STATUS] || '').trim();
+  const cell = sheet.getRange(row, cols[M.STATUS]);
+  if (!id) { if (value) cell.setValue(''); return null; }
+  const truth = currentStatus_(id, rec);
+  if (value === truth) return null;
+  const link = rowLink_(sheet, row, cols[M.STATUS]);
+
+  // 管理者（スクリプトの所有者）は、テストや修正のためにどの値にも変えられる
+  if (isAdmin_(editor)) {
+    setStatus_(id, value);
+    if (value === S.APPROVED || value === S.REJECTED) return decide_(sheet, cols, rec, value, editor);
+    writeRow_(sheet, cols, row, { [M.APPROVER]: '', [M.APPROVED_AT]: '' });
+    return `[info][title]【修正】${id} のステータスを管理者が「${value || '空欄'}」にしました[/title]${link}[/info]`;
+  }
+
+  let error = '';
+  if (!editor) error = '操作した人のアカウントを確認できませんでした。';
+  else if (truth !== S.PENDING) error = `この申請はすでに「${truth}」です。`;
+  else if (value !== S.APPROVED && value !== S.REJECTED) error = `「${value || '空欄'}」には変更できません。「承認」か「却下」を選んでください。`;
+  else if (editor.toLowerCase() === String(rec[F.EMAIL]).toLowerCase()) error = '申請者本人は承認・却下できません。';
+
+  if (error) {
+    cell.setValue(truth);
+    return `[info][title]【取り消し】${id} の承認ステータスの変更を元に戻しました[/title]` +
+      `操作した人：${editor || '不明'}\n選ばれた値：${value || '空欄'}\n理由：${error}\n${link}[/info]`;
+  }
+  setStatus_(id, value);
+  return decide_(sheet, cols, rec, value, editor);
+}
+
+// 複数セルをまとめて変えた場合：管理者以外は全部元に戻す
+function bulkEdit_(sheet, cols, firstRow, lastRow, editor) {
+  const admin = isAdmin_(editor);
+  const changed = [];
+  for (let row = firstRow; row <= lastRow; row++) {
+    const rec = readRow_(sheet, cols, row);
+    const id = rec[M.ID];
+    const value = String(rec[M.STATUS] || '').trim();
+    const cell = sheet.getRange(row, cols[M.STATUS]);
+    if (!id) { if (value && !admin) cell.setValue(''); continue; }
+    const truth = currentStatus_(id, rec);
+    if (value === truth) continue;
+    if (admin) setStatus_(id, value);
+    else cell.setValue(truth);
+    changed.push(id);
+  }
+  if (!changed.length || admin) return null;
+  return `[info][title]【取り消し】複数のセルをまとめて変更したため、元に戻しました[/title]` +
+    `操作した人：${editor || '不明'}\n対象：${changed.join('、')}\n` +
+    `承認・却下は、1件ずつプルダウンで選んでください。[/info]`;
+}
+
+function decide_(sheet, cols, rec, value, editor) {
+  const now = new Date();
+  writeRow_(sheet, cols, rec._row, { [M.APPROVER]: editor, [M.APPROVED_AT]: now });
+  rec[M.STATUS] = value;
+  rec[M.APPROVER] = editor;
+  rec[M.APPROVED_AT] = now;
+  return value === S.APPROVED ? approvedMessage_(rec) : rejectedMessage_(rec);
+}
+
+
+// ===== トリガー：時間主導（F9） =====
+// 成果報告が遅れているもの（稼働終了日から REMIND_AFTER_DAYS 日たっても未入力）だけを、申請した部長にメンションして督促
+function dailyReminder() {
+  const today = startOfDay_(new Date());
+  if (today.getDay() === 0 || today.getDay() === 6) return;
+  const sheet = applySheet_();
+  const cols = columns_(sheet);
+  const last = sheet.getLastRow();
+  if (last < 2) return;
+
+  const late = [];
+  for (let row = 2; row <= last; row++) {
+    const rec = readRow_(sheet, cols, row);
+    if (!rec[M.ID]) continue;
+    const st = rec[M.STATUS];
+    if ((st === S.APPROVED || st === S.NOT_REQUIRED) && rec[M.RESULT_STATUS] !== RS.DONE && rec[F.END] instanceof Date) {
+      if (today >= addDays_(startOfDay_(rec[F.END]), CONFIG.REMIND_AFTER_DAYS)) late.push(rec);
+    }
+  }
+  if (!late.length) return;
+
+  const t = MESSAGES['督促'];
+  const extra = { '件数': late.length };
+  postChatwork_(mention_(...late.map(rec => rec[F.APPLY_DEPT])) +
+    `[info][title]${fill_(t['タイトル'], {}, extra)}[/title]${fill_(t['前置き'], {}, extra)}\n\n` +
+    late.map(rec => fill_(t['行'], rec)).join('\n') + '[/info]');
+}
+
+
+// ===== Chatworkの文面の組み立て（文面そのものは上の MESSAGES で変える） =====
+function summary_(rec) {
+  return fill_(MESSAGES['概要'], rec);
+}
+
+function approvalRequestMessage_(rec, link) {
+  return mention_(rec[F.TARGET_DEPT]) + compose_('承認依頼', rec, { 'シートのリンク': link });
+}
+
+function noApprovalMessage_(rec) {
+  return mention_(rec[F.TARGET_DEPT], rec[F.APPLY_DEPT]) + compose_('承認不要', rec);
+}
+
+function approvedMessage_(rec) {
+  return mention_(rec[F.APPLY_DEPT]) + compose_('承認', rec);
+}
+
+function rejectedMessage_(rec) {
+  return mention_(rec[F.APPLY_DEPT]) + compose_('却下', rec);
+}
+
+function resultMessage_(rec, again) {
+  const st = rec[M.STATUS];
+  const note = (st === S.APPROVED || st === S.NOT_REQUIRED) ? '' : `\n※承認ステータスが「${st}」の申請への報告です。`;
+  return mention_(rec[F.TARGET_DEPT]) + compose_('成果報告', rec, { '再提出': again ? '（再提出）' : '', '注意書き': note });
+}
+
+// MESSAGES の「タイトル」と「本文」に差し込みをして、枠付きの1通にする
+function compose_(kind, rec, extra) {
+  const t = MESSAGES[kind];
+  return `[info][title]${fill_(t['タイトル'], rec, extra)}[/title]${fill_(t['本文'], rec, extra)}[/info]`;
+}
+
+// 文面の {名前} を、申請の内容に置き換える。一覧にない名前は {…} のまま残す（打ち間違いに気づけるように）
+function fill_(template, rec, extra) {
+  const v = {
+    '管理ID': () => rec[M.ID],
+    '申請部門': () => dept_(rec[F.APPLY_DEPT]).dept,
+    '申請部長': () => applyPerson_(rec),
+    '稼働先部門': () => dept_(rec[F.TARGET_DEPT]).dept,
+    '稼働先部長': () => targetPerson_(rec),
+    '稼働メンバー': () => rec[F.MEMBER],
+    '開始日': () => fmt_(rec[F.START], 'yyyy/MM/dd'),
+    '終了日': () => fmt_(rec[F.END], 'yyyy/MM/dd'),
+    '予定時間': () => rec[F.HOURS],
+    '目的': () => rec[F.PURPOSE],
+    '承認者': () => rec[M.APPROVER],
+    '却下理由': () => String(rec[M.REASON] || '').trim() || '（未記入。シートの「却下理由」を確認してください）',
+    '実績時間': () => rec[M.ACTUAL],
+    '成果内容': () => rec[M.RESULT],
+    '成果報告URL': () => resultUrl_(rec[M.ID]),
+    '概要': () => fill_(MESSAGES['概要'], rec),
+  };
+  Object.keys(extra || {}).forEach(k => { v[k] = () => extra[k]; });
+  return String(template).replace(/\{([^{}\n]+)\}/g, (all, key) => {
+    if (!v[key]) return all;
+    const x = v[key]();
+    return x === undefined || x === null ? '' : String(x);
+  });
+}
+
+function chatworkEnabled_() {
+  const p = PropertiesService.getScriptProperties();
+  return !!(p.getProperty('CHATWORK_TOKEN') && p.getProperty('CHATWORK_ROOM_ID'));
+}
+
+function postChatwork_(body) {
+  body = mentionHeader_() + body;
+  if (!chatworkEnabled_()) {
+    console.log('[Chatwork未設定のため、投稿内容をログに出力]\n' + body);
+    return;
+  }
+  const p = PropertiesService.getScriptProperties();
+  const res = UrlFetchApp.fetch(`https://api.chatwork.com/v2/rooms/${p.getProperty('CHATWORK_ROOM_ID')}/messages`, {
+    method: 'post',
+    headers: { 'X-ChatWorkToken': p.getProperty('CHATWORK_TOKEN') },
+    payload: { body: body },
+    muteHttpExceptions: true,
+  });
+  const code = res.getResponseCode();
+  if (code < 200 || code >= 300) throw new Error(`Chatworkへの投稿に失敗しました（${code}）：${res.getContentText()}`);
+}
+
+// スクリプト プロパティ CHATWORK_TO（アカウントID。複数はカンマ区切り）があれば、先頭に [To:ID] を付ける
+function mentionHeader_() {
+  const raw = String(PropertiesService.getScriptProperties().getProperty('CHATWORK_TO') || '');
+  const ids = raw.split(/[,、\s]+/).filter(Boolean);
+  const bad = ids.filter(id => !/^\d+$/.test(id));
+  if (bad.length) console.warn(`CHATWORK_TO に数字以外が含まれています（${bad.join('、')}）。アカウントIDは数字だけです。`);
+  const good = ids.filter(id => /^\d+$/.test(id));
+  return good.length ? good.map(id => `[To:${id}]`).join('') + '\n' : '';
+}
+
+// Chatworkの接続確認（手動で実行）
+function testChatwork() {
+  if (!chatworkEnabled_()) throw new Error('CHATWORK_TOKEN と CHATWORK_ROOM_ID が未登録です。');
+  postChatwork_('[info][title]接続テスト[/title]他部門稼働の通知テストです。[/info]');
+}
+
+// 通知先グループのメンバーとアカウントIDを実行ログに出す（手動で実行。CHATWORK_TO に入れる番号を調べる用）
+function listChatworkMembers() {
+  if (!chatworkEnabled_()) throw new Error('CHATWORK_TOKEN と CHATWORK_ROOM_ID が未登録です。');
+  const p = PropertiesService.getScriptProperties();
+  const res = UrlFetchApp.fetch(`https://api.chatwork.com/v2/rooms/${p.getProperty('CHATWORK_ROOM_ID')}/members`, {
+    headers: { 'X-ChatWorkToken': p.getProperty('CHATWORK_TOKEN') },
+    muteHttpExceptions: true,
+  });
+  if (res.getResponseCode() !== 200) throw new Error(`メンバーを取得できませんでした（${res.getResponseCode()}）：${res.getContentText()}`);
+  const lines = JSON.parse(res.getContentText()).map(m => `${m.account_id}　${m.name}`);
+  console.log('アカウントID　名前\n' + lines.join('\n'));
+}
+
+
+// ===== 初期設定（手動で実行） =====
+// 管理列・プルダウン・保護・成果報告URL・トリガーを用意する。何度実行してもよい
+function setup() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const apply = ss.getSheetByName(CONFIG.SHEET_APPLY);
+  const result = ss.getSheetByName(CONFIG.SHEET_RESULT);
+  if (!apply || !result) {
+    throw new Error(`シート「${CONFIG.SHEET_APPLY}」と「${CONFIG.SHEET_RESULT}」が必要です。フォームの回答先をこのスプレッドシートにし、回答シートの名前を変更してください。`);
+  }
+  requireCols_(columns_(apply), Object.values(F));
+  requireCols_(columns_(result), Object.values(R));
+
+  // 管理列を右端に追加
+  M_ORDER.forEach(h => {
+    if (columns_(apply)[h]) return;
+    const c = apply.getLastColumn() + 1;
+    if (c > apply.getMaxColumns()) apply.insertColumnsAfter(apply.getMaxColumns(), c - apply.getMaxColumns());
+    apply.getRange(1, c).setValue(h);
+  });
+  const cols = columns_(apply);
+  if (apply.getMaxRows() < CONFIG.PREPARED_ROWS) {
+    apply.insertRowsAfter(apply.getMaxRows(), CONFIG.PREPARED_ROWS - apply.getMaxRows());
+  }
+  const n = apply.getMaxRows() - 1;
+  apply.getRange(1, 1, 1, apply.getLastColumn()).setFontWeight('bold');
+  apply.setFrozenRows(1);
+  apply.getRange(2, cols[M.STATUS], n, 1).setDataValidation(
+    SpreadsheetApp.newDataValidation()
+      .requireValueInList([S.PENDING, S.APPROVED, S.REJECTED, S.NOT_REQUIRED], true)
+      .setAllowInvalid(false).build());
+  [M.APPROVED_AT, M.REPORTED_AT].forEach(h => apply.getRange(2, cols[h], n, 1).setNumberFormat('yyyy/mm/dd hh:mm'));
+
+  // setup より前に届いていた申請に管理IDを振る（通知はしない）
+  const filled = backfill_(apply, cols);
+
+  // 保護：申請回答は「承認ステータス」「却下理由」だけ編集可、成果回答は編集不可
+  [apply, result].forEach(sh => sh.getProtections(SpreadsheetApp.ProtectionType.SHEET).forEach(p => p.remove()));
+  const pa = apply.protect().setDescription('他部門稼働：承認ステータスと却下理由以外は編集不可');
+  pa.setUnprotectedRanges([apply.getRange(2, cols[M.STATUS], n, 1), apply.getRange(2, cols[M.REASON], n, 1)]);
+  ownerOnly_(pa);
+  ownerOnly_(result.protect().setDescription('他部門稼働：成果報告フォームの回答（編集不可）'));
+
+  // 成果報告フォームの「管理ID入力済みURL」
+  PropertiesService.getScriptProperties().setProperty('RESULT_FORM_URL', buildPrefilledUrl_(result));
+
+  // トリガー（重複しないよう作り直す）
+  const handlers = ['handleFormSubmit', 'handleEdit', 'dailyReminder'];
+  ScriptApp.getProjectTriggers().forEach(t => { if (handlers.indexOf(t.getHandlerFunction()) >= 0) ScriptApp.deleteTrigger(t); });
+  ScriptApp.newTrigger('handleFormSubmit').forSpreadsheet(ss).onFormSubmit().create();
+  ScriptApp.newTrigger('handleEdit').forSpreadsheet(ss).onEdit().create();
+  ScriptApp.newTrigger('dailyReminder').timeBased().everyDays(1).atHour(CONFIG.REMIND_HOUR).create();
+
+  const noId = MANAGERS.filter(m => !/^\d+$/.test(String(m.accountId || '').trim())).map(m => m.dept);
+  if (noId.length) console.warn(`部長一覧で accountId が未設定の部門：${noId.join('、')}（メンションなしで通知します）`);
+  console.log(`初期設定が完了しました。既存の申請 ${filled} 件に管理IDを振りました。` +
+    `Chatwork通知：${chatworkEnabled_() ? 'あり' : 'なし（投稿内容は実行ログに出ます）'}`);
+}
+
+function backfill_(sheet, cols) {
+  let count = 0;
+  withLock_(() => {
+    for (let row = 2; row <= sheet.getLastRow(); row++) {
+      const rec = readRow_(sheet, cols, row);
+      if (rec[M.ID] || !rec[F.TIMESTAMP]) continue;
+      const status = Number(rec[F.HOURS]) <= CONFIG.NO_APPROVAL_MAX_HOURS ? S.NOT_REQUIRED : S.PENDING;
+      const id = nextId_();
+      writeRow_(sheet, cols, row, { [M.ID]: id, [M.STATUS]: status, [M.RESULT_STATUS]: RS.NONE });
+      setStatus_(id, status);
+      count++;
+    }
+  });
+  return count;
+}
+
+function ownerOnly_(protection) {
+  protection.addEditor(Session.getEffectiveUser());
+  protection.removeEditors(protection.getEditors());
+  if (protection.canDomainEdit()) protection.setDomainEdit(false);
+}
+
+function buildPrefilledUrl_(resultSheet) {
+  const url = resultSheet.getFormUrl();
+  if (!url) throw new Error(`シート「${resultSheet.getName()}」に成果報告フォームが連携されていません。`);
+  const form = FormApp.openByUrl(url);
+  const item = form.getItems(FormApp.ItemType.TEXT).filter(i => i.getTitle() === R.ID)[0];
+  if (!item) throw new Error(`成果報告フォームに記述式の設問「${R.ID}」がありません。`);
+  return form.createResponse().withItemResponse(item.asTextItem().createResponse(ID_MARK)).toPrefilledUrl();
+}
+
+
+// ===== 共通処理 =====
+function applySheet_() {
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(CONFIG.SHEET_APPLY);
+  if (!sh) throw new Error(`シート「${CONFIG.SHEET_APPLY}」がありません。`);
+  return sh;
+}
+
+// 見出し名 → 列番号（1始まり）
+function columns_(sheet) {
+  const width = sheet.getLastColumn();
+  const cols = {};
+  if (width < 1) return cols;
+  sheet.getRange(1, 1, 1, width).getValues()[0].forEach((h, i) => {
+    const k = String(h).trim();
+    if (k && !cols[k]) cols[k] = i + 1;
+  });
+  return cols;
+}
+
+function requireCols_(cols, names) {
+  const missing = names.filter(n => !cols[n]);
+  if (missing.length) {
+    throw new Error(`見出し「${missing.join('」「')}」が見つかりません。フォームの設問名を確認するか、setup を実行してください。`);
+  }
+}
+
+function readRow_(sheet, cols, row) {
+  const values = sheet.getRange(row, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const rec = { _row: row };
+  Object.keys(cols).forEach(k => { rec[k] = values[cols[k] - 1]; });
+  return rec;
+}
+
+function writeRow_(sheet, cols, row, updates) {
+  Object.keys(updates).forEach(k => sheet.getRange(row, cols[k]).setValue(updates[k]));
+}
+
+function findRowById_(sheet, cols, id) {
+  if (!id || sheet.getLastRow() < 2) return null;
+  const cell = sheet.getRange(2, cols[M.ID], sheet.getLastRow() - 1, 1)
+    .createTextFinder(id).matchEntireCell(true).findNext();
+  return cell ? cell.getRow() : null;
+}
+
+function rowLink_(sheet, row, col) {
+  return `${sheet.getParent().getUrl()}#gid=${sheet.getSheetId()}&range=${sheet.getRange(row, col).getA1Notation()}`;
+}
+
+function resultUrl_(id) {
+  const url = PropertiesService.getScriptProperties().getProperty('RESULT_FORM_URL');
+  if (!url) throw new Error('成果報告フォームのURLが未設定です。setup を実行してください。');
+  return url.replace(ID_MARK, encodeURIComponent(id));
+}
+
+// 承認ステータスの正しい値は、シートとは別にスクリプト プロパティにも持つ（勝手な書き換えを元に戻すため）
+function currentStatus_(id, rec) {
+  const v = PropertiesService.getScriptProperties().getProperty('ST:' + id);
+  if (v !== null) return v;
+  return rec[M.APPROVED_AT] ? String(rec[M.STATUS]) : S.PENDING;
+}
+
+function setStatus_(id, value) {
+  PropertiesService.getScriptProperties().setProperty('ST:' + id, value);
+}
+
+function nextId_() {
+  const p = PropertiesService.getScriptProperties();
+  const seq = Number(p.getProperty('SEQ') || 0) + 1;
+  p.setProperty('SEQ', String(seq));
+  return 'W' + String(seq).padStart(4, '0');
+}
+
+function isAdmin_(email) {
+  const owner = Session.getEffectiveUser().getEmail();
+  return !!email && !!owner && email.toLowerCase() === owner.toLowerCase();
+}
+
+function firstTime_(key) {
+  return withLock_(() => {
+    const cache = CacheService.getScriptCache();
+    if (cache.get(key)) return false;
+    cache.put(key, '1', 21600);
+    return true;
+  });
+}
+
+function withLock_(fn) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try { return fn(); } finally { lock.releaseLock(); }
+}
+
+// 「制作部（田中）」→ { dept: '制作部', head: '田中' }
+function dept_(value) {
+  const s = String(value || '').trim();
+  const m = s.match(/^(.+?)\s*[（(]\s*(.+?)\s*[）)]$/);
+  return m ? { dept: m[1], head: m[2] } : { dept: s, head: '' };
+}
+
+function person_(value) {
+  const d = dept_(value);
+  const m = manager_(value);
+  const name = (m && m.name) || d.head;
+  return name ? name + 'さん' : d.dept + 'の部長';
+}
+
+// 部門の値（「制作部（田中）」や「制作部」）から、部長一覧の行を探す
+function manager_(value) {
+  const d = dept_(value).dept;
+  return MANAGERS.filter(m => m.dept === d)[0] || null;
+}
+
+// 部門の値を受け取り、その部長あての「[To:ID]名前さん」を作る（同じ人は1回だけ。IDが空なら付けない）
+function mention_(...values) {
+  const seen = {};
+  const lines = [];
+  values.forEach(v => {
+    const m = manager_(v);
+    const id = m ? String(m.accountId || '').trim() : '';
+    if (!/^\d+$/.test(id) || seen[id]) return;
+    seen[id] = true;
+    lines.push(`[To:${id}]${m.name}さん`);
+  });
+  return lines.length ? lines.join('\n') + '\n' : '';
+}
+
+function applyPerson_(rec) { return person_(rec[F.APPLY_DEPT]); }
+function targetPerson_(rec) { return person_(rec[F.TARGET_DEPT]); }
+
+function fmt_(d, pattern) {
+  return d instanceof Date ? Utilities.formatDate(d, CONFIG.TIMEZONE, pattern) : String(d || '');
+}
+
+function startOfDay_(d) {
+  const x = new Date(d);
+  x.setHours(0, 0, 0, 0);
+  return x;
+}
+
+function addDays_(d, n) {
+  const x = new Date(d);
+  x.setDate(x.getDate() + n);
+  return x;
+}
+
+
+// ===== 文面の確認用（手動で実行。Chatworkには送らず、実行ログに出すだけ） =====
+function previewMessages() {
+  const rec = {
+    [M.ID]: 'W0000',
+    [F.APPLY_DEPT]: MANAGERS[0] ? MANAGERS[0].dept : '営業部',
+    [F.TARGET_DEPT]: MANAGERS[1] ? MANAGERS[1].dept : '制作部',
+    [F.MEMBER]: '山田太郎',
+    [F.START]: new Date(2026, 10, 2),
+    [F.END]: new Date(2026, 10, 6),
+    [F.HOURS]: 20,
+    [F.PURPOSE]: '提案資料の作成支援',
+    [M.STATUS]: S.APPROVED,
+    [M.APPROVER]: 'approver@example.com',
+    [M.REASON]: '今週は納期が重なっているため',
+    [M.ACTUAL]: 18,
+    [M.RESULT]: '提案が通り、受注見込み200万円',
+  };
+  const link = 'https://docs.google.com/spreadsheets/d/（例）/edit#gid=0&range=K2';
+  const t = MESSAGES['督促'];
+  const list = [
+    ['承認依頼', () => approvalRequestMessage_(rec, link)],
+    ['承認不要の届出', () => noApprovalMessage_(rec)],
+    ['承認', () => approvedMessage_(rec)],
+    ['却下', () => rejectedMessage_(rec)],
+    ['成果報告', () => resultMessage_(rec, false)],
+    ['督促（1件の例）', () => mention_(rec[F.APPLY_DEPT]) +
+      `[info][title]${fill_(t['タイトル'], {}, { '件数': 1 })}[/title]${fill_(t['前置き'], {}, { '件数': 1 })}\n\n` +
+      fill_(t['行'], rec) + '[/info]'],
+  ];
+  list.forEach(([name, build]) => {
+    try { console.log(`----- ${name} -----\n` + build()); }
+    catch (err) { console.log(`----- ${name} -----\n（作れませんでした：${err.message}）`); }
+  });
+}
