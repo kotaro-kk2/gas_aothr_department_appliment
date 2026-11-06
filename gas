@@ -1,198 +1,55 @@
 /**
- * 他部門稼働 申請・承認・成果報告（職務権限 No.43）
- * マスタ版：申請者と承認者を、シート「マスタ」で管理する
+ * 他部門稼働 申請・承認・成果報告（職務権限 No.43）【処理】
+ * 設定（CONFIG・F・R・REQUIRED_F・REQUIRED_R・MASTER・MENTIONS・NOTIFY・MESSAGES）は、別の設定ファイルに書く
  *
  * しくみ
  *   申請フォーム → シート「申請回答」
  *     ・回答者のメールアドレスから、マスタで申請者名を補完する
- *     ・申請者が選んだ本部の「承認者」に、Chatworkで承認依頼を送る
- *   承認 → 申請回答シートの「承認ステータス」をプルダウンで選ぶ
- *     ・ONLY_MASTER_APPROVER が true なら、その本部の承認者（マスタに登録された人）だけが有効
- *   成果報告フォーム → シート「成果回答」 → 申請回答シートに転記して共有
- *   毎朝 → 成果報告が遅れているものを督促
+ *     ・稼働期間が上限（CONFIG.MAX_BUSINESS_DAYS 営業日）を超えたら、自動で却下する
+ *     ・それ以外は、申請者が選んだ本部の承認者に、Chatworkで承認依頼を送る
+ *   承認 → 「承認ステータス」で「承認」「却下」「修正」のどれかを選ぶ
+ *     ・却下：「理由（却下・修正）」の入力が必須
+ *     ・修正：理由は任意（直してほしい点を一覧から選べる）
+ *     ・却下も修正も、その申請はそこで終わり。申請者が新しく申請し直す
+ *   成果報告フォーム → シート「成果回答」
+ *     ・申請者本人（またはその本部の承認者・管理者）による、承認済みの申請への報告だけを転記する
+ *     ・転記できなかった報告は、「処理結果（自動）」列に理由を残し、Chatworkで知らせる
+ *   毎朝 → 取りこぼした申請・報告の再処理、送れなかった通知の再送、成果報告の督促
  *
- * 初回の手順
- *   1. 下の「フォームの設問名」（F と R）に、実際のフォームの設問名を入力する
- *   2. setup を実行する（「マスタ」シートがなければ、見出し付きで作って止まる）
- *   3. 「マスタ」シートに申請者と承認者を入力し、もう一度 setup を実行する
- *   4. Chatworkを使うときは、スクリプト プロパティに CHATWORK_TOKEN と CHATWORK_ROOM_ID を登録
- *      （任意）CHATWORK_TO にアカウントIDを入れると、全通知の先頭にその人あてのTOが付く（テスト用）
+ * エディタから手で実行する関数
+ *   setup（初期設定。何度実行してもよい）／reprocessPending（取りこぼしの再処理）／
+ *   retryFailedNotifications（通知の再送）／testChatwork（実際に送信して接続を確認）／
+ *   listChatworkMembers／previewMessages／checkLatestApplication（この3つは送信しない）
  */
-
-// ===== 設定 =====
-const CONFIG = {
-  // この時間「以下」の申請は承認不要（届出のみ）。0 なら全件で承認が必要
-  NO_APPROVAL_MAX_HOURS: 0,
-  // 稼働終了日から何日たっても成果が未入力なら督促するか
-  REMIND_AFTER_DAYS: 3,
-  // 督促を送る時刻（時）
-  REMIND_HOUR: 9,
-  // true：申請者の本部の承認者（マスタで区分が「承認者」の人）だけが承認・却下できる
-  // false：申請者本人以外なら誰でも承認・却下できる（操作した人の記録は残る）
-  ONLY_MASTER_APPROVER: true,
-  // 申請回答シートで、承認列のプルダウンと保護を用意しておく行数
-  PREPARED_ROWS: 2000,
-  TIMEZONE: 'Asia/Tokyo',
-  SHEET_APPLY: '申請回答',
-  SHEET_RESULT: '成果回答',
-};
-
-
-// ===== フォームの設問名（ここに、実際のフォームの設問名をそのまま入力する） =====
-// ' と ' の間に、フォームの設問名を1文字も違わず入れる（シートの1行目からコピーすると確実）
-// 「必須」の項目が空のままだと、setup とフォーム送信時にエラーで知らせる
-
-// 申請フォーム（＝申請回答シートの見出し）
-const F = {
-  TIMESTAMP: 'タイムスタンプ',   // フォームが自動で作る列（通常は変更不要）
-  EMAIL: 'メールアドレス',       // 「メールアドレスを収集する」で自動で作られる列（通常は変更不要）
-  APPLY_HONBU: '',               // 必須：申請者の所属本部（ラジオボタン。選択肢はマスタの本部名と同じ文字にする）
-  MEMBER: '',                    // 必須：稼働させたいメンバー
-  TARGET_HONBU: '',              // 任意：稼働メンバーの所属本部（空なら、稼働先の本部への通知はしない）
-  START: '',                     // 必須：稼働開始日（「日付」の設問）
-  END: '',                       // 必須：稼働終了日（「日付」の設問）
-  HOURS: '',                     // 必須：予定時間（数字だけの回答）
-  PURPOSE: '',                   // 任意：目的・期待する成果
-};
-
-// 成果報告フォーム（＝成果回答シートの見出し）
-const R = {
-  EMAIL: 'メールアドレス',       // 自動で作られる列（通常は変更不要）
-  ID: '',                        // 必須：管理ID（記述式。通知のリンクから開くと入力済みになる）
-  ACTUAL: '',                    // 必須：実績時間（数字だけの回答）
-  RESULT: '',                    // 必須：成果内容
-};
-
-const REQUIRED_F = ['APPLY_HONBU', 'MEMBER', 'START', 'END', 'HOURS'];
-const REQUIRED_R = ['ID', 'ACTUAL', 'RESULT'];
-
-
-// ===== マスタ（申請者・承認者の一覧） =====
-// シート「マスタ」の1行目の見出しと、区分に入れる言葉
-const MASTER = {
-  SHEET: 'マスタ',
-  ROLE: '区分',                  // 「申請者」か「承認者」
-  HONBU: '本部名',               // 申請フォームの本部の選択肢と同じ文字にする
-  NAME: '名前',
-  MAIL: 'mail',                  // フォームで収集されるメールアドレスと同じもの
-  CW_ID: 'chatwork_account_ID',  // ChatworkのアカウントID（数字）。空ならメンションなしで名前だけ通知
-  APPLICANT: '申請者',
-  APPROVER: '承認者',
-};
-
-
-// ===== 通知ごとのメンション先 =====
-// 使える言葉：'申請者'（申請した人）／'承認者'（申請者の本部の承認者）／'稼働先承認者'（稼働先の本部の承認者）
-const MENTIONS = {
-  '承認依頼': ['承認者'],
-  '承認不要': ['承認者', '稼働先承認者', '申請者'],
-  '承認': ['申請者', '稼働先承認者'],
-  '却下': ['申請者'],
-  '成果報告': ['承認者', '稼働先承認者'],
-  '督促': ['申請者'],
-};
-
-
-// ===== 通知の文面（ここの日本語を書き換えれば、Chatworkの文面が変わる） =====
-//   ・` と ` の間は自由に書き換えられる。改行もそのまま反映される（行頭の空白も文面に入る）
-//   ・{ } で囲んだ部分には、申請の内容が自動で入る。{ } は必ず半角で書く
-//   ・先頭のメンション（[To:ID]名前さん）と、枠（[info]）・見出し（[title]）は自動で付く
-//   ・名前の差し込みには「さん」が付かないので、文面側で付ける。承認者が複数なら「佐藤・鈴木」のように並ぶ
-//   使える差し込み：
-//     {管理ID} {申請者名} {申請者メール} {申請本部} {承認者名}
-//     {稼働メンバー} {稼働先本部} {稼働先承認者名}
-//     {開始日} {終了日} {予定時間} {目的} {概要}
-//     {承認した人} {却下理由} {実績時間} {成果内容} {成果報告URL}
-//     {シートのリンク}（承認依頼だけ）　{件数}（督促のタイトルと前置きだけ）
-//     {再提出}（成果報告だけ）　{注意書き}（承認依頼・承認不要・成果報告。問題があるときだけ注意の行が入る）
-const MESSAGES = {
-  // すべての通知に入る共通の数行。{概要} と書いた場所に入る
-  '概要': `申請者：{申請者名}（{申請本部}）
-稼働メンバー：{稼働メンバー}（{稼働先本部}）
-期間：{開始日}〜{終了日}（予定{予定時間}時間）`,
-
-  '承認依頼': {
-    'タイトル': '【承認依頼】他部門稼働 {管理ID}',
-    '本文': `{承認者名}さん、{申請者名}さんから承認依頼です。{注意書き}
-
-{概要}
-目的：{目的}
-
-▼シートの「承認ステータス」で「承認」か「却下」を選んでください（却下のときは先に「却下理由」を記入）
-{シートのリンク}`,
-  },
-
-  '承認不要': {
-    'タイトル': '【稼働のお知らせ】他部門稼働 {管理ID}（権限内のため承認不要）',
-    '本文': `{申請者名}さんの稼働の届出です。{注意書き}
-
-{概要}
-目的：{目的}
-
-▼稼働後の成果報告フォーム
-{成果報告URL}`,
-  },
-
-  '承認': {
-    'タイトル': '【承認】他部門稼働 {管理ID}',
-    '本文': `{申請者名}さん、{稼働メンバー}さんの稼働が承認されました。
-
-{概要}
-承認した人：{承認した人}
-
-▼稼働後の成果報告フォーム（管理IDは入力済み）
-{成果報告URL}`,
-  },
-
-  '却下': {
-    'タイトル': '【却下】他部門稼働 {管理ID}',
-    '本文': `{申請者名}さん、申請は却下されました。
-
-{概要}
-却下理由：{却下理由}
-対応した人：{承認した人}`,
-  },
-
-  // {再提出} は2回目以降の報告のときだけ「（再提出）」になる
-  '成果報告': {
-    'タイトル': '【成果報告{再提出}】他部門稼働 {管理ID}',
-    '本文': `{申請者名}さんから、{稼働メンバー}さんの稼働成果の報告です。{注意書き}
-
-{概要}
-実績：{実績時間}時間
-成果：
-{成果内容}`,
-  },
-
-  // 稼働終了から日数がたっても成果報告がないものだけ。「行」は1件ごとに繰り返される
-  '督促': {
-    'タイトル': '【督促】成果報告がまだの他部門稼働（{件数}件）',
-    '前置き': '稼働終了から日数がたっていますが、成果報告が届いていません。下のリンクから報告をお願いします。',
-    '行': `・{管理ID}　{申請者名}さん：{稼働メンバー}（{稼働先本部}）稼働終了 {終了日}
-　{成果報告URL}`,
-  },
-};
-
 
 // ===== 申請回答シートの右側に足す管理列（この順で追加する） =====
 const M = {
   ID: '管理ID',
   APPLICANT_NAME: '申請者名（自動）',
   STATUS: '承認ステータス',
-  REASON: '却下理由',
+  REASON: '理由（却下・修正）',
   APPROVER: '承認者',
   APPROVED_AT: '承認日時',
   RESULT_STATUS: '成果入力ステータス',
-  ACTUAL: '実績時間',
+  ACTUAL: '実績日数',
   RESULT: '成果内容',
   REPORTED_AT: '成果報告日時',
 };
-const M_ORDER = [M.ID, M.APPLICANT_NAME, M.STATUS, M.REASON, M.APPROVER, M.APPROVED_AT,
-  M.RESULT_STATUS, M.ACTUAL, M.RESULT, M.REPORTED_AT];
+const M_ORDER = Object.values(M);
+// 以前の版の列名 → 今の列名（setup で見出しを書き換える）
+const RENAMED = { '却下理由': M.REASON };
+// 成果回答シートの右側に足す列
+const RM = { RESULT: '処理結果（自動）' };
 
-const S = { PENDING: '申請中', APPROVED: '承認', REJECTED: '却下', NOT_REQUIRED: '承認不要' };
+const S = { PENDING: '申請中', APPROVED: '承認', REJECTED: '却下', REVISE: '修正' };
+const DECISIONS = [S.APPROVED, S.REJECTED, S.REVISE];
 const RS = { NONE: '未入力', DONE: '入力完了' };
+const AUTO_APPROVER = '（自動判定）';   // 稼働期間の上限超えで自動却下したときの「承認者」欄
 const ID_MARK = 'ZZIDZZ';
+// 設定の NOTIFY・MENTIONS・MESSAGES に必要な通知の種類
+const KINDS = ['承認依頼', '承認', '却下', '修正', '成果報告', '督促'];
+const ERR_HEADERS = ['発生日時', '状態', '再送日時', '種類', '管理ID', 'エラーの内容', '送る予定だった内容'];
+const PROTECT_PREFIX = '他部門稼働：';
 
 
 // ===== トリガー：フォーム送信時 =====
@@ -201,73 +58,155 @@ function handleFormSubmit(e) {
   const sheet = e.range.getSheet();
   const name = sheet.getName();
   if (name !== CONFIG.SHEET_APPLY && name !== CONFIG.SHEET_RESULT) return;
-  // 送信トリガーが二重に動くことがあるため、同じ行は一度だけ処理する
-  if (!firstTime_('submit:' + name + ':' + e.range.getRow())) return;
   checkConfig_();
-  if (name === CONFIG.SHEET_APPLY) onApplication_(sheet, e.range.getRow());
-  else onResult_(sheet, e.range.getRow());
+  // 同じ行は一度しか処理しない（申請は管理ID、成果報告は「処理結果（自動）」で判定する）
+  if (name === CONFIG.SHEET_APPLY) acceptApplication_(sheet, e.range.getRow(), true);
+  else acceptResult_(sheet, e.range.getRow(), true);
 }
 
-// 申請の受付：管理ID・申請者名・初期ステータスを入れ、承認依頼を送る
-function onApplication_(sheet, row) {
+
+// ===== 申請の受付（フォーム送信時と、取りこぼしの再処理で共通） =====
+// 管理IDは最後に書く。途中で止まっても、管理IDのない行として再処理できるようにするため
+function acceptApplication_(sheet, row, notify) {
   const cols = columns_(sheet);
   requireCols_(cols, usedF_().concat(M_ORDER), 'フォームの設問名（F）を確認するか、setup を実行してください。');
-  const rec = withLock_(() => {
+  const out = withLock_(() => {
     const r = readRow_(sheet, cols, row);
-    if (r[M.ID]) return null; // 採番済み
-    const status = initialStatus_(r[F.HOURS]);
-    const id = nextId_();
+    if (r[M.ID] || !r[F.TIMESTAMP]) return null; // 処理済み、または空の行
     const p = personByMail_(r[F.EMAIL], MASTER.APPLICANT);
+    const period = periodCheck_(r);
+    const status = period.reject ? S.REJECTED : S.PENDING;
+    const id = nextId_();
     writeRow_(sheet, cols, row, {
-      [M.ID]: id,
       [M.APPLICANT_NAME]: p ? p.name : '（マスタ未登録）',
       [M.STATUS]: status,
+      [M.REASON]: period.reject,
+      [M.APPROVER]: period.reject ? AUTO_APPROVER : '',
+      [M.APPROVED_AT]: period.reject ? new Date() : '',
       [M.RESULT_STATUS]: RS.NONE,
     });
     setStatus_(id, status);
-    return readRow_(sheet, cols, row);
+    writeRow_(sheet, cols, row, { [M.ID]: id });
+    return { rec: readRow_(sheet, cols, row), note: period.note };
   });
-  if (!rec) return;
-  postChatwork_(rec[M.STATUS] === S.PENDING
-    ? message_('承認依頼', rec, { 'シートのリンク': rowLink_(sheet, row, cols[M.STATUS]), '注意書き': applicationNotes_(rec) })
-    : message_('承認不要', rec, { '注意書き': applicationNotes_(rec) }));
+  if (!out) return null;
+  if (notify) {
+    const rec = out.rec;
+    if (rec[M.STATUS] === S.REJECTED) postChatwork_(message_('却下', rec), '却下', rec[M.ID]);
+    else postChatwork_(message_('承認依頼', rec, {
+      'シートのリンク': rowLink_(sheet, row, cols[M.STATUS]),
+      '注意書き': applicationNotes_(rec) + out.note,
+    }), '承認依頼', rec[M.ID]);
+  }
+  return out.rec;
 }
 
-// 成果報告の受付：申請回答シートに転記し、共有する
-function onResult_(resultSheet, row) {
+// 稼働期間の確認。{ reject: 却下理由（問題なければ ''）, note: 承認依頼に添える注意書き }
+function periodCheck_(r) {
+  const s = r[F.START], e = r[F.END];
+  if (!(s instanceof Date) || !(e instanceof Date)) {
+    return { reject: '', note: '\n※稼働開始日・終了日を日付として読めないため、期間を自動で確認していません。' };
+  }
+  const start = startOfDay_(s), end = startOfDay_(e);
+  if (end < start) return { reject: '稼働終了日が稼働開始日より前になっています。日付を確認して、申請し直してください。', note: '' };
+  if ((end - start) / 86400000 > 366) return { reject: '稼働期間が1年を超えています。日付（特に年）を確認して、申請し直してください。', note: '' };
+  const max = Number(CONFIG.MAX_BUSINESS_DAYS);
+  if (!(max > 0)) return { reject: '', note: '' };
+  const h = holidays_(start, end);
+  const n = countBusinessDays_(start, end, h.set);
+  if (n <= max) return { reject: '', note: h.ok ? '' : `\n※祝日を確認できなかったため、土日だけを除いて数えています（${n}営業日）。` };
+  if (!h.ok) {
+    return { reject: '', note: `\n※祝日を確認できなかったため、自動で却下していません。土日だけを除くと${n}営業日で、上限（${max}営業日）を超えています。期間を確認して判断してください。` };
+  }
+  return { reject: `稼働期間が${n}営業日あり、上限の${max}営業日を超えています。${max}営業日以内にして、申請し直してください。`, note: '' };
+}
+
+// 期間内の祝日。{ set: { 'yyyy-MM-dd': true }, ok: 読めたか }
+function holidays_(start, end) {
+  if (!CONFIG.SKIP_HOLIDAYS) return { set: {}, ok: true };
+  try {
+    const cal = CalendarApp.getCalendarById(CONFIG.HOLIDAY_CALENDAR_ID);
+    if (!cal) return { set: {}, ok: false };
+    const set = {};
+    cal.getEvents(start, addDays_(end, 1)).forEach(ev => { set[fmt_(ev.getAllDayStartDate(), 'yyyy-MM-dd')] = true; });
+    return { set: set, ok: true };
+  } catch (err) {
+    console.warn('祝日カレンダーを読めませんでした：' + err);
+    return { set: {}, ok: false };
+  }
+}
+
+// 開始日から終了日までの営業日数（両端を含む。土日と、渡された祝日を除く）
+function countBusinessDays_(start, end, holidaySet) {
+  let n = 0;
+  for (let d = new Date(start); d <= end; d = addDays_(d, 1)) {
+    const w = d.getDay();
+    if (w === 0 || w === 6 || holidaySet[fmt_(d, 'yyyy-MM-dd')]) continue;
+    n++;
+  }
+  return n;
+}
+
+
+// ===== 成果報告の受付（フォーム送信時と、取りこぼしの再処理で共通） =====
+// 条件に合う報告だけを申請回答シートに転記し、成果回答シートの「処理結果（自動）」に結果を残す
+function acceptResult_(resultSheet, row, notify) {
   const rcols = columns_(resultSheet);
-  requireCols_(rcols, usedR_(), 'フォームの設問名（R）を確認してください。');
-  const r = readRow_(resultSheet, rcols, row);
-  const id = String(r[R.ID] || '').trim();
+  requireCols_(rcols, usedR_().concat([RM.RESULT]), 'フォームの設問名（R）を確認するか、setup を実行してください。');
   const apply = applySheet_();
   const cols = columns_(apply);
-
   const out = withLock_(() => {
+    const r = readRow_(resultSheet, rcols, row);
+    if (String(r[RM.RESULT] || '').trim()) return null;                   // 処理済み
+    if (!String(r[R.ID] || '').trim() && !String(r[R.RESULT] || '').trim()) return null; // 空の行
+    const id = String(r[R.ID] || '').trim().toUpperCase();
     const target = findRowById_(apply, cols, id);
-    if (!target) return null;
-    const again = readRow_(apply, cols, target)[M.RESULT_STATUS] === RS.DONE;
+    const rec = target ? readRow_(apply, cols, target) : null;
+    const reporter = hasR_('EMAIL') ? String(r[R.EMAIL] || '').trim() : '';
+    const problem = resultProblem_(r, rec, reporter);
+    const mark = text => resultSheet.getRange(row, rcols[RM.RESULT]).setValue(text);
+    if (problem) {
+      mark('要確認：' + problem);
+      return { ok: false, id: id, reporter: reporter, problem: problem };
+    }
+    const again = rec[M.RESULT_STATUS] === RS.DONE;
     writeRow_(apply, cols, target, {
-      [M.ACTUAL]: Number(r[R.ACTUAL]),
+      [M.ACTUAL]: Number(String(r[R.ACTUAL]).trim()),
       [M.RESULT]: String(r[R.RESULT] || '').trim(),
       [M.REPORTED_AT]: new Date(),
       [M.RESULT_STATUS]: RS.DONE,
     });
-    return { rec: readRow_(apply, cols, target), again: again };
+    mark(again ? '反映済み（再提出）' : '反映済み');
+    return { ok: true, rec: readRow_(apply, cols, target), again: again };
   });
-
-  if (!out) {
-    postChatwork_(`[info][title]【要確認】成果報告の管理IDが見つかりません[/title]` +
-      `管理ID：${id || '（空欄）'}\n報告者：${r[R.EMAIL] || '不明'}\n` +
-      `「${CONFIG.SHEET_RESULT}」シートの内容を確認してください。[/info]`);
-    return;
+  if (!out || !notify) return out;
+  if (!out.ok) {
+    postChatwork_(`[info][title]【要確認】成果報告を反映できませんでした[/title]` +
+      `管理ID：${out.id || '（空欄）'}\n報告者：${nameByMail_(out.reporter) || '不明'}\n理由：${out.problem}\n` +
+      `「${CONFIG.SHEET_RESULT}」シートの「${RM.RESULT}」列を確認してください。[/info]`, '要確認', out.id);
+  } else {
+    postChatwork_(message_('成果報告', out.rec, { '再提出': out.again ? '（再提出）' : '' }), '成果報告', out.rec[M.ID]);
   }
-  const st = out.rec[M.STATUS];
-  const note = (st === S.APPROVED || st === S.NOT_REQUIRED) ? '' : `\n※承認ステータスが「${st}」の申請への報告です。`;
-  postChatwork_(message_('成果報告', out.rec, { '再提出': out.again ? '（再提出）' : '', '注意書き': note }));
+  return out;
+}
+
+// 成果報告を転記してよいか。問題がなければ ''、あれば理由を返す
+function resultProblem_(r, rec, reporter) {
+  if (!rec) return '管理IDが申請回答シートにありません。';
+  const who = reporter.toLowerCase();
+  if (hasR_('EMAIL') && who !== String(rec[F.EMAIL] || '').trim().toLowerCase() && !isApproverFor_(who, rec) && !isAdmin_(who)) {
+    return '報告者が、この申請の申請者でも承認者でもありません（管理IDの入力間違いの可能性があります）。';
+  }
+  const st = currentStatus_(rec[M.ID], rec);
+  if (st !== S.APPROVED) return `承認ステータスが「${st}」の申請です。成果報告できるのは承認済みの申請だけです。`;
+  const t = String(r[R.ACTUAL] === null || r[R.ACTUAL] === undefined ? '' : r[R.ACTUAL]).trim();
+  if (t === '' || !isFinite(Number(t)) || Number(t) < 0) return `実績（${t || '空欄'}）が0以上の数字ではありません。`;
+  if (!String(r[R.RESULT] || '').trim()) return '成果内容が空欄です。';
+  return '';
 }
 
 
-// ===== トリガー：編集時（承認・却下） =====
+// ===== トリガー：編集時（承認・却下・修正） =====
 function handleEdit(e) {
   if (!e || !e.range) throw new Error('この関数はシートの編集で自動的に動きます。エディタから実行せず、承認ステータスを選んで試してください。');
   const range = e.range;
@@ -279,50 +218,61 @@ function handleEdit(e) {
   const firstRow = Math.max(2, range.getRow());
   const lastRow = range.getLastRow();
   if (lastRow < firstRow) return;
+  checkConfig_();
 
   const editor = String((e.user && e.user.getEmail && e.user.getEmail()) || '').trim();
   const bulk = range.getNumRows() > 1 || range.getNumColumns() > 1;
-
-  const message = withLock_(() => bulk
+  const out = withLock_(() => bulk
     ? bulkEdit_(sheet, cols, firstRow, lastRow, editor)
-    : statusEdit_(sheet, cols, firstRow, editor));
-  if (message) postChatwork_(message);
+    : statusEdit_(sheet, cols, firstRow, editor, e.value));
+  if (out && out.body) postChatwork_(out.body, out.kind, out.id);
 }
 
-// 1セルの変更：承認・却下を記録するか、無効なら元に戻す
-function statusEdit_(sheet, cols, row, editor) {
+// 1セルの変更：承認・却下・修正を記録するか、無効なら元に戻す
+//   chosen は、この編集で選ばれた値（e.value）。シートを読み直した値ではなく、操作した人が選んだ値で判定する
+function statusEdit_(sheet, cols, row, editor, chosen) {
   const rec = readRow_(sheet, cols, row);
   const id = rec[M.ID];
-  const value = String(rec[M.STATUS] || '').trim();
   const cell = sheet.getRange(row, cols[M.STATUS]);
-  if (!id) { if (value) cell.setValue(''); return null; }
+  const current = String(rec[M.STATUS] || '').trim();
+  const value = chosen === undefined || chosen === null ? '' : String(chosen).trim();
+  if (!id) { if (current) cell.setValue(''); return null; }
   const truth = currentStatus_(id, rec);
-  if (value === truth) return null;
   const link = rowLink_(sheet, row, cols[M.STATUS]);
+  const revert = (title, detail) => {
+    cell.setValue(truth);
+    return { kind: '管理', id: id, body: `[info][title]【取り消し】${id} ${title}[/title]${detail}\n${link}[/info]` };
+  };
 
-  // 管理者（スクリプトの所有者）は、テストや修正のためにどの値にも変えられる
-  if (isAdmin_(editor)) {
-    setStatus_(id, value);
-    if (value === S.APPROVED || value === S.REJECTED) return decide_(sheet, cols, rec, value, editor);
-    writeRow_(sheet, cols, row, { [M.APPROVER]: '', [M.APPROVED_AT]: '' });
-    return `[info][title]【修正】${id} のステータスを管理者が「${value || '空欄'}」にしました[/title]${link}[/info]`;
+  // 同じセルが続けて操作され、この操作の値がもう残っていない
+  if (current !== value) {
+    if (current === truth) return null; // 先に処理された操作で、すでに元に戻っている
+    return revert('の承認ステータスが続けて変更されたため、元に戻しました',
+      `操作した人：${nameByMail_(editor) || '不明'}\nもう一度、1人だけで選び直してください。`);
   }
+  if (value === truth) return null;
 
+  const admin = isAdmin_(editor);
   let error = '';
   if (!editor) error = '操作した人のアカウントを確認できませんでした。';
-  else if (truth !== S.PENDING) error = `この申請はすでに「${truth}」です。`;
-  else if (value !== S.APPROVED && value !== S.REJECTED) error = `「${value || '空欄'}」には変更できません。「承認」か「却下」を選んでください。`;
-  else if (editor.toLowerCase() === String(rec[F.EMAIL]).toLowerCase()) error = '申請者本人は承認・却下できません。';
-  else if (CONFIG.ONLY_MASTER_APPROVER && !isApproverFor_(editor, rec)) {
-    error = `承認・却下できるのは、${honbuName_(rec[F.APPLY_HONBU])}の承認者（マスタに登録された人）だけです。`;
+  else if (!admin && truth !== S.PENDING) error = `この申請はすでに「${truth}」です。`;
+  else if (DECISIONS.indexOf(value) < 0 && !(admin && value === S.PENDING)) error = `「${value || '空欄'}」には変更できません。「${DECISIONS.join('」「')}」のどれかを選んでください。`;
+  else if (!admin && editor.toLowerCase() === String(rec[F.EMAIL]).trim().toLowerCase()) error = '申請者本人は操作できません。';
+  else if (!admin && CONFIG.ONLY_MASTER_APPROVER && !isApproverFor_(editor, rec)) {
+    error = `操作できるのは、${honbuName_(rec[F.APPLY_HONBU])}の承認者（マスタに登録された人）だけです。`;
+  } else if (value === S.REJECTED && !String(rec[M.REASON] || '').trim()) {
+    error = `却下するときは、先に「${M.REASON}」を入力してください。`;
+  }
+  if (error) {
+    return revert('の承認ステータスの変更を元に戻しました',
+      `操作した人：${nameByMail_(editor) || '不明'}\n選ばれた値：${value || '空欄'}\n理由：${error}`);
   }
 
-  if (error) {
-    cell.setValue(truth);
-    return `[info][title]【取り消し】${id} の承認ステータスの変更を元に戻しました[/title]` +
-      `操作した人：${nameByMail_(editor) || '不明'}\n選ばれた値：${value || '空欄'}\n理由：${error}\n${link}[/info]`;
-  }
   setStatus_(id, value);
+  if (value === S.PENDING) { // 管理者が申請中に戻した
+    writeRow_(sheet, cols, row, { [M.APPROVER]: '', [M.APPROVED_AT]: '' });
+    return { kind: '管理', id: id, body: `[info][title]【管理者による変更】${id} を「${S.PENDING}」に戻しました[/title]操作した人：${nameByMail_(editor)}\n${link}[/info]` };
+  }
   return decide_(sheet, cols, rec, value, editor);
 }
 
@@ -342,70 +292,101 @@ function bulkEdit_(sheet, cols, firstRow, lastRow, editor) {
     changed.push(id);
   }
   if (!changed.length) return null;
-  return `[info][title]【取り消し】複数のセルをまとめて変更したため、元に戻しました[/title]` +
+  return { kind: '管理', id: changed.join('、'), body: `[info][title]【取り消し】複数のセルをまとめて変更したため、元に戻しました[/title]` +
     `操作した人：${nameByMail_(editor) || '不明'}\n対象：${changed.join('、')}\n` +
-    `承認・却下は、1件ずつプルダウンで選んでください。[/info]`;
+    `承認・却下・修正は、1件ずつプルダウンで選んでください。[/info]` };
 }
 
+// 承認・却下・修正の確定：承認者と日時を記録し、その種類の通知を作る
 function decide_(sheet, cols, rec, value, editor) {
   const now = new Date();
   writeRow_(sheet, cols, rec._row, { [M.APPROVER]: editor, [M.APPROVED_AT]: now });
   rec[M.STATUS] = value;
   rec[M.APPROVER] = editor;
   rec[M.APPROVED_AT] = now;
-  return message_(value === S.APPROVED ? '承認' : '却下', rec);
-}
-
-// 申請時の承認ステータスを決める。判定できないときは、必ず承認が必要な「申請中」にする
-//   1. 予定時間が空・数字でない・0以下なら「申請中」
-//   2. NO_APPROVAL_MAX_HOURS が0（または正の数でない）なら「申請中」
-//   3. 設定が正の数のときだけ、予定時間がそれ以下なら「承認不要」
-function initialStatus_(hoursValue) {
-  const text = String(hoursValue === null || hoursValue === undefined ? '' : hoursValue).trim();
-  const hours = Number(text);
-  if (text === '' || !isFinite(hours) || hours <= 0) return S.PENDING;
-  const limit = Number(CONFIG.NO_APPROVAL_MAX_HOURS);
-  if (!(limit > 0)) return S.PENDING;
-  return hours <= limit ? S.NOT_REQUIRED : S.PENDING;
+  return { kind: value, id: rec[M.ID], body: message_(value, rec) };
 }
 
 
-// ===== トリガー：時間主導（督促） =====
-// 成果報告が遅れているもの（稼働終了日から REMIND_AFTER_DAYS 日たっても未入力）だけを督促
+// ===== トリガー：時間主導（毎朝） =====
 function dailyReminder() {
   checkConfig_();
+  safely_('取りこぼしの再処理', () => reprocessPending_(true));
+  safely_('通知の再送', retryFailedNotifications);
+
   const today = startOfDay_(new Date());
   if (today.getDay() === 0 || today.getDay() === 6) return;
+  if (!notifyEnabled_('督促')) return;
   const sheet = applySheet_();
   const cols = columns_(sheet);
   const last = sheet.getLastRow();
   if (last < 2) return;
 
+  // 成果報告が遅れているもの（承認済みで、稼働終了日から REMIND_AFTER_DAYS 日たっても未入力）
+  const values = sheet.getRange(2, 1, last - 1, sheet.getLastColumn()).getValues();
   const late = [];
-  for (let row = 2; row <= last; row++) {
-    const rec = readRow_(sheet, cols, row);
-    if (!rec[M.ID]) continue;
-    const st = rec[M.STATUS];
-    if ((st === S.APPROVED || st === S.NOT_REQUIRED) && rec[M.RESULT_STATUS] !== RS.DONE && rec[F.END] instanceof Date) {
-      if (today >= addDays_(startOfDay_(rec[F.END]), CONFIG.REMIND_AFTER_DAYS)) late.push(rec);
-    }
-  }
+  values.forEach((v, i) => {
+    const rec = { _row: i + 2 };
+    Object.keys(cols).forEach(k => { rec[k] = v[cols[k] - 1]; });
+    if (!rec[M.ID] || rec[M.STATUS] !== S.APPROVED || rec[M.RESULT_STATUS] === RS.DONE || !(rec[F.END] instanceof Date)) return;
+    if (today >= addDays_(startOfDay_(rec[F.END]), CONFIG.REMIND_AFTER_DAYS)) late.push(rec);
+  });
   if (!late.length) return;
 
   const t = MESSAGES['督促'];
   const extra = { '件数': late.length };
   let people = [];
-  late.forEach(rec => { people = people.concat(recipients_(rec, MENTIONS['督促'] || [])); });
+  late.forEach(rec => { people = people.concat(recipients_(rec, MENTIONS['督促'])); });
   postChatwork_(mentionText_(people) +
     `[info][title]${fill_(t['タイトル'], {}, extra)}[/title]${fill_(t['前置き'], {}, extra)}\n\n` +
-    late.map(rec => fill_(t['行'], rec)).join('\n') + '[/info]');
+    late.map(rec => fill_(t['行'], rec)).join('\n') + '[/info]', '督促', '');
+}
+
+// 取りこぼした申請・成果報告を処理する（手動で実行。毎朝も自動で実行される）
+function reprocessPending() {
+  checkConfig_();
+  const n = reprocessPending_(true);
+  console.log(`再処理：申請 ${n.applications} 件、成果報告 ${n.results} 件`);
+}
+
+function reprocessPending_(notify) {
+  const apply = applySheet_();
+  const cols = columns_(apply);
+  const appRows = unprocessedRows_(apply, cols[F.TIMESTAMP], cols[M.ID]);
+  appRows.forEach(row => acceptApplication_(apply, row, notify));
+  const result = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(CONFIG.SHEET_RESULT);
+  const rcols = result ? columns_(result) : {};
+  const resRows = rcols[RM.RESULT] ? unprocessedRows_(result, 1, rcols[RM.RESULT]) : [];
+  resRows.forEach(row => acceptResult_(result, row, notify));
+  return { applications: appRows.length, results: resRows.length };
+}
+
+// keyCol が埋まっていて doneCol が空の行（＝未処理の行）の行番号を返す
+function unprocessedRows_(sheet, keyCol, doneCol) {
+  const last = sheet.getLastRow();
+  if (last < 2 || !keyCol || !doneCol) return [];
+  const values = sheet.getRange(2, 1, last - 1, Math.max(keyCol, doneCol)).getValues();
+  const rows = [];
+  values.forEach((v, i) => {
+    if (String(v[keyCol - 1]).trim() !== '' && String(v[doneCol - 1]).trim() === '') rows.push(i + 2);
+  });
+  return rows;
+}
+
+function safely_(label, fn) {
+  try { fn(); } catch (err) { console.error(`${label}で失敗しました：${err}`); }
 }
 
 
-// ===== 通知の組み立て（文面そのものは上の MESSAGES で変える） =====
-// 通知の種類ごとに、メンション（MENTIONS）と文面（MESSAGES）を組み合わせる
+// ===== 通知の組み立て =====
+function notifyEnabled_(kind) {
+  return NOTIFY[kind] !== false;
+}
+
+// 通知の種類ごとに、メンション（MENTIONS）と文面（MESSAGES）を組み合わせる。オフの通知は '' を返す
 function message_(kind, rec, extra) {
-  return mentionText_(recipients_(rec, MENTIONS[kind] || [])) + compose_(kind, rec, extra);
+  if (!notifyEnabled_(kind)) return '';
+  return mentionText_(recipients_(rec, MENTIONS[kind])) + compose_(kind, rec, extra);
 }
 
 // MESSAGES の「タイトル」と「本文」に差し込みをして、枠付きの1通にする
@@ -416,6 +397,7 @@ function compose_(kind, rec, extra) {
 
 // 文面の {名前} を、申請の内容に置き換える。一覧にない名前は {…} のまま残す（打ち間違いに気づけるように）
 function fill_(template, rec, extra) {
+  const reason = () => String(rec[M.REASON] || '').trim();
   const v = {
     '管理ID': () => rec[M.ID],
     '申請者名': () => applicantName_(rec),
@@ -427,11 +409,12 @@ function fill_(template, rec, extra) {
     '稼働先承認者名': () => hasF_('TARGET_HONBU') ? names_(approversOf_(rec[F.TARGET_HONBU])) : '',
     '開始日': () => fmt_(rec[F.START], 'yyyy/MM/dd'),
     '終了日': () => fmt_(rec[F.END], 'yyyy/MM/dd'),
-    '予定時間': () => rec[F.HOURS],
     '目的': () => hasF_('PURPOSE') ? rec[F.PURPOSE] : '',
+    '予定時間': () => hasF_('HOURS') ? rec[F.HOURS] : '',   // 以前の版の文面との互換用
     '承認した人': () => nameByMail_(rec[M.APPROVER]),
-    '却下理由': () => String(rec[M.REASON] || '').trim() || '（未記入。シートの「却下理由」を確認してください）',
-    '実績時間': () => rec[M.ACTUAL],
+    '理由': () => reason() || '（記載なし。承認者に確認してください）',
+    '却下理由': () => reason() || '（記載なし。承認者に確認してください）',
+    '実績日数': () => rec[M.ACTUAL],
     '成果内容': () => rec[M.RESULT],
     '成果報告URL': () => resultUrl_(rec[M.ID]),
     '概要': () => fill_(MESSAGES['概要'], rec),
@@ -451,7 +434,7 @@ function fill_(template, rec, extra) {
 // MENTIONS の言葉（申請者／承認者／稼働先承認者）を、マスタの人に置き換える
 function recipients_(rec, roles) {
   let people = [];
-  roles.forEach(role => {
+  (roles || []).forEach(role => {
     if (role === '申請者') {
       const p = personByMail_(rec[F.EMAIL], MASTER.APPLICANT);
       if (p) people.push(p);
@@ -494,29 +477,23 @@ function applicationNotes_(rec) {
 // ===== マスタの読み取り =====
 let MASTER_CACHE_ = null;
 
-// マスタの全行を読む（1回の実行につき1回だけ読む）
+// マスタの全行を読む（1回の実行につき1回だけ、まとめて読む）
 function master_() {
   if (MASTER_CACHE_) return MASTER_CACHE_;
   const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(MASTER.SHEET);
   if (!sh) throw new Error(`シート「${MASTER.SHEET}」がありません。setup を実行してください。`);
   const cols = columns_(sh);
   requireCols_(cols, [MASTER.ROLE, MASTER.HONBU, MASTER.NAME, MASTER.MAIL, MASTER.CW_ID], 'マスタの1行目の見出しを確認してください。');
-  const list = [];
-  for (let row = 2; row <= sh.getLastRow(); row++) {
-    const r = readRow_(sh, cols, row);
-    const mail = String(r[MASTER.MAIL] || '').trim().toLowerCase();
-    const name = String(r[MASTER.NAME] || '').trim();
-    if (!mail && !name) continue;
-    list.push({
-      role: String(r[MASTER.ROLE] || '').trim(),
-      honbu: String(r[MASTER.HONBU] || '').trim(),
-      name: name,
-      mail: mail,
-      cw: String(r[MASTER.CW_ID] === null || r[MASTER.CW_ID] === undefined ? '' : r[MASTER.CW_ID]).trim(),
-    });
-  }
-  MASTER_CACHE_ = list;
-  return list;
+  const last = sh.getLastRow();
+  const values = last < 2 ? [] : sh.getRange(2, 1, last - 1, sh.getLastColumn()).getValues();
+  const get = (v, h) => { const x = v[cols[h] - 1]; return x === null || x === undefined ? '' : String(x).trim(); };
+  MASTER_CACHE_ = values
+    .map(v => ({
+      role: get(v, MASTER.ROLE), honbu: get(v, MASTER.HONBU), name: get(v, MASTER.NAME),
+      mail: get(v, MASTER.MAIL).toLowerCase(), cw: get(v, MASTER.CW_ID),
+    }))
+    .filter(p => p.mail || p.name);
+  return MASTER_CACHE_;
 }
 
 // メールアドレスからマスタの人を探す（同じ人が複数行あれば、preferRole の区分を優先）
@@ -536,10 +513,13 @@ function approversOf_(honbuValue) {
 
 function isApproverFor_(mail, rec) {
   const m = String(mail || '').trim().toLowerCase();
-  return approversOf_(rec[F.APPLY_HONBU]).some(p => p.mail === m);
+  return !!m && approversOf_(rec[F.APPLY_HONBU]).some(p => p.mail === m);
 }
 
+// 申請者名は、申請時に保存した名前を使う（なければマスタから探す）
 function applicantName_(rec) {
+  const saved = String(rec[M.APPLICANT_NAME] || '').trim();
+  if (saved && saved !== '（マスタ未登録）') return saved;
   const p = personByMail_(rec[F.EMAIL], MASTER.APPLICANT);
   return p ? p.name : `（マスタ未登録）${rec[F.EMAIL] || ''}`;
 }
@@ -561,28 +541,105 @@ function honbuName_(value) {
   return m ? m[1] : s;
 }
 
+// 管理者かどうか（設定の CONFIG.ADMIN_EMAILS に入っている人）
+function isAdmin_(email) {
+  const m = String(email || '').trim().toLowerCase();
+  return !!m && CONFIG.ADMIN_EMAILS.map(x => String(x).trim().toLowerCase()).indexOf(m) >= 0;
+}
 
-// ===== Chatworkへの送信 =====
+
+// ===== Chatworkへの送信と、送れなかった通知の記録 =====
 function chatworkEnabled_() {
   const p = PropertiesService.getScriptProperties();
   return !!(p.getProperty('CHATWORK_TOKEN') && p.getProperty('CHATWORK_ROOM_ID'));
 }
 
-function postChatwork_(body) {
+// 1通送る。kind（通知の種類）と id（管理ID）は、失敗したときの記録と再送の判断に使う
+function postChatwork_(body, kind, id) {
+  if (!body) return;
   body = mentionHeader_() + body;
   if (!chatworkEnabled_()) {
     console.log('[Chatwork未設定のため、投稿内容をログに出力]\n' + body);
     return;
   }
-  const p = PropertiesService.getScriptProperties();
-  const res = UrlFetchApp.fetch(`https://api.chatwork.com/v2/rooms/${p.getProperty('CHATWORK_ROOM_ID')}/messages`, {
-    method: 'post',
-    headers: { 'X-ChatWorkToken': p.getProperty('CHATWORK_TOKEN') },
-    payload: { body: body },
-    muteHttpExceptions: true,
+  const err = sendChatwork_(body);
+  if (err) {
+    recordFailure_(body, err, kind, id);
+    console.error(`Chatworkへの送信に失敗したため、「${CONFIG.SHEET_ERROR}」シートに記録しました：${err}`);
+  }
+}
+
+// Chatworkに1通送る。成功なら ''、失敗なら理由を返す（エラーで止まらない）
+function sendChatwork_(body) {
+  try {
+    const p = PropertiesService.getScriptProperties();
+    const res = UrlFetchApp.fetch(`https://api.chatwork.com/v2/rooms/${p.getProperty('CHATWORK_ROOM_ID')}/messages`, {
+      method: 'post',
+      headers: { 'X-ChatWorkToken': p.getProperty('CHATWORK_TOKEN') },
+      payload: { body: body },
+      muteHttpExceptions: true,
+    });
+    const code = res.getResponseCode();
+    return code >= 200 && code < 300 ? '' : `HTTP ${code}：${String(res.getContentText()).slice(0, 300)}`;
+  } catch (e) {
+    return String((e && e.message) || e);
+  }
+}
+
+function recordFailure_(body, err, kind, id) {
+  try {
+    const sh = errorSheet_();
+    const cols = columns_(sh);
+    const row = new Array(sh.getLastColumn()).fill('');
+    const put = (h, v) => { row[cols[h] - 1] = v; };
+    put('発生日時', new Date()); put('状態', '未送信'); put('種類', kind || ''); put('管理ID', id || '');
+    put('エラーの内容', err); put('送る予定だった内容', body);
+    sh.appendRow(row);
+  } catch (e) {
+    console.error('通知エラーの記録にも失敗しました：' + e);
+  }
+}
+
+// 「通知エラー」シート。なければ作り、足りない見出しは右端に足す
+function errorSheet_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh = ss.getSheetByName(CONFIG.SHEET_ERROR);
+  if (!sh) {
+    sh = ss.insertSheet(CONFIG.SHEET_ERROR);
+    sh.setFrozenRows(1);
+  }
+  ERR_HEADERS.forEach(h => {
+    if (columns_(sh)[h]) return;
+    const c = sh.getLastColumn() + 1;
+    if (c > sh.getMaxColumns()) sh.insertColumnsAfter(sh.getMaxColumns(), c - sh.getMaxColumns());
+    sh.getRange(1, c).setValue(h).setFontWeight('bold');
   });
-  const code = res.getResponseCode();
-  if (code < 200 || code >= 300) throw new Error(`Chatworkへの投稿に失敗しました（${code}）：${res.getContentText()}`);
+  return sh;
+}
+
+// 「未送信」の通知を再送する（毎朝自動で実行。手動で実行してもよい）
+//   承認依頼は、まだ「申請中」のときだけ送る。督促は翌朝に作り直されるので再送しない
+function retryFailedNotifications() {
+  if (!chatworkEnabled_()) return;
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(CONFIG.SHEET_ERROR);
+  if (!sh || sh.getLastRow() < 2) return;
+  const cols = columns_(sh);
+  const values = sh.getRange(2, 1, sh.getLastRow() - 1, sh.getLastColumn()).getValues();
+  const col = h => cols[h] - 1;
+  let ok = 0, ng = 0, skip = 0;
+  values.forEach((v, i) => {
+    if (v[col('状態')] !== '未送信') return;
+    const row = i + 2;
+    const kind = cols['種類'] ? String(v[col('種類')]) : '';
+    const id = cols['管理ID'] ? String(v[col('管理ID')]) : '';
+    const setStatus = (status) => sh.getRange(row, cols['状態']).setValue(status);
+    if (kind === '督促') { setStatus('再送不要（翌朝に作り直し）'); skip++; return; }
+    if (kind === '承認依頼' && id && storedStatus_(id) !== S.PENDING) { setStatus('再送不要（対応済み）'); skip++; return; }
+    const err = sendChatwork_(v[col('送る予定だった内容')]);
+    if (!err) { setStatus('再送済み'); sh.getRange(row, cols['再送日時']).setValue(new Date()); ok++; }
+    else { sh.getRange(row, cols['エラーの内容']).setValue(`${v[col('エラーの内容')]}\n${fmt_(new Date(), 'MM/dd HH:mm')} 再送も失敗：${err}`); ng++; }
+  });
+  if (ok || ng || skip) console.log(`通知の再送：成功 ${ok} 件、失敗 ${ng} 件、再送不要 ${skip} 件`);
 }
 
 // スクリプト プロパティ CHATWORK_TO（アカウントID。複数はカンマ区切り）があれば、先頭に [To:ID] を付ける（テスト用）
@@ -610,15 +667,23 @@ function setup() {
   requireCols_(columns_(apply), usedF_(), 'F に入力した設問名が、申請回答シートの1行目と一致しているか確認してください。');
   requireCols_(columns_(result), usedR_(), 'R に入力した設問名が、成果回答シートの1行目と一致しているか確認してください。');
   const clash = usedF_().filter(h => M_ORDER.indexOf(h) >= 0);
-  if (clash.length) throw new Error(`フォームの設問名と管理列の名前が同じです（${clash.join('、')}）。M の名前か、設問名を変えてください。`);
+  if (clash.length) throw new Error(`フォームの設問名と管理列の名前が同じです（${clash.join('、')}）。設問名を変えてください。`);
 
-  // 管理列を右端に追加
-  M_ORDER.forEach(h => {
-    if (columns_(apply)[h]) return;
-    const c = apply.getLastColumn() + 1;
-    if (c > apply.getMaxColumns()) apply.insertColumnsAfter(apply.getMaxColumns(), c - apply.getMaxColumns());
-    apply.getRange(1, c).setValue(h);
+  // 以前の版の列名を、今の列名に書き換える
+  Object.keys(RENAMED).forEach(oldName => {
+    const c = columns_(apply);
+    if (c[oldName] && !c[RENAMED[oldName]]) apply.getRange(1, c[oldName]).setValue(RENAMED[oldName]);
   });
+  // 管理列を右端に追加
+  M_ORDER.forEach(h => addColumn_(apply, h));
+  // 成果回答シートに「処理結果（自動）」列を追加。以前からある回答は、以前の版で処理済みとして印を付ける
+  if (!columns_(result)[RM.RESULT]) {
+    addColumn_(result, RM.RESULT);
+    const rc = columns_(result)[RM.RESULT];
+    const last = result.getLastRow();
+    if (last >= 2) result.getRange(2, rc, last - 1, 1).setValue('以前の版で処理済み');
+  }
+
   const cols = columns_(apply);
   if (apply.getMaxRows() < CONFIG.PREPARED_ROWS) {
     apply.insertRowsAfter(apply.getMaxRows(), CONFIG.PREPARED_ROWS - apply.getMaxRows());
@@ -627,33 +692,63 @@ function setup() {
   apply.getRange(1, 1, 1, apply.getLastColumn()).setFontWeight('bold');
   apply.setFrozenRows(1);
   apply.getRange(2, cols[M.STATUS], n, 1).setDataValidation(
-    SpreadsheetApp.newDataValidation()
-      .requireValueInList([S.PENDING, S.APPROVED, S.REJECTED, S.NOT_REQUIRED], true)
-      .setAllowInvalid(false).build());
+    SpreadsheetApp.newDataValidation().requireValueInList([S.PENDING].concat(DECISIONS), true).setAllowInvalid(false).build());
+  // 理由の列：よく使う理由を一覧から選べるようにする（一覧にない文も入力できる）
+  const choices = (CONFIG.REASON_CHOICES || []).filter(x => String(x).trim());
+  apply.getRange(2, cols[M.REASON], n, 1).setDataValidation(choices.length
+    ? SpreadsheetApp.newDataValidation().requireValueInList(choices, true).setAllowInvalid(true).build()
+    : null);
   [M.APPROVED_AT, M.REPORTED_AT].forEach(h => apply.getRange(2, cols[h], n, 1).setNumberFormat('yyyy/mm/dd hh:mm'));
 
   // setup より前に届いていた申請に管理IDを振る（通知はしない）
-  const filled = backfill_(apply, cols);
+  const pending = reprocessPending_(false);
 
-  // 保護：申請回答は「承認ステータス」「却下理由」だけ編集可、成果回答は編集不可
-  [apply, result].forEach(sh => sh.getProtections(SpreadsheetApp.ProtectionType.SHEET).forEach(p => p.remove()));
-  const pa = apply.protect().setDescription('他部門稼働：承認ステータスと却下理由以外は編集不可');
+  // 保護：このGASが付けた保護だけを作り直す
+  //   申請回答は「承認ステータス」「理由」だけ編集可。成果回答・通知エラーは管理者のみ
+  const es = errorSheet_();
+  [apply, result, es].forEach(sh => sh.getProtections(SpreadsheetApp.ProtectionType.SHEET)
+    .filter(p => String(p.getDescription()).indexOf(PROTECT_PREFIX) === 0).forEach(p => p.remove()));
+  const pa = apply.protect().setDescription(PROTECT_PREFIX + '承認ステータスと理由以外は編集不可');
   pa.setUnprotectedRanges([apply.getRange(2, cols[M.STATUS], n, 1), apply.getRange(2, cols[M.REASON], n, 1)]);
   ownerOnly_(pa);
-  ownerOnly_(result.protect().setDescription('他部門稼働：成果報告フォームの回答（編集不可）'));
+  ownerOnly_(result.protect().setDescription(PROTECT_PREFIX + '成果報告フォームの回答（編集不可）'));
+  ownerOnly_(es.protect().setDescription(PROTECT_PREFIX + '通知エラーの記録（管理者のみ編集）'));
 
   // 成果報告フォームの「管理ID入力済みURL」
   PropertiesService.getScriptProperties().setProperty('RESULT_FORM_URL', buildPrefilledUrl_(result));
 
-  // トリガー（重複しないよう作り直す）
+  // トリガー（重複しないよう作り直す。トリガーは実行した人のものになるので、いつも同じアカウントで実行する）
   const handlers = ['handleFormSubmit', 'handleEdit', 'dailyReminder'];
   ScriptApp.getProjectTriggers().forEach(t => { if (handlers.indexOf(t.getHandlerFunction()) >= 0) ScriptApp.deleteTrigger(t); });
   ScriptApp.newTrigger('handleFormSubmit').forSpreadsheet(ss).onFormSubmit().create();
   ScriptApp.newTrigger('handleEdit').forSpreadsheet(ss).onEdit().create();
   ScriptApp.newTrigger('dailyReminder').timeBased().everyDays(1).atHour(CONFIG.REMIND_HOUR).create();
 
-  console.log(masterReport + `\n初期設定が完了しました。既存の申請 ${filled} 件に管理IDを振りました。` +
-    `Chatwork通知：${chatworkEnabled_() ? 'あり' : 'なし（投稿内容は実行ログに出ます）'}`);
+  // 稼働期間の上限と、祝日カレンダーの確認（初回はカレンダーの権限の承認を求められる）
+  let periodReport = '稼働期間の上限：なし';
+  if (Number(CONFIG.MAX_BUSINESS_DAYS) > 0) {
+    periodReport = `稼働期間の上限：${CONFIG.MAX_BUSINESS_DAYS}営業日`;
+    if (CONFIG.SKIP_HOLIDAYS) {
+      const y = new Date().getFullYear();
+      const h = holidays_(new Date(y, 0, 1), new Date(y, 11, 31));
+      periodReport += h.ok ? `（祝日を除く。今年の祝日 ${Object.keys(h.set).length} 日を読み込めました）`
+        : '（祝日カレンダーを読めません。上限を超える申請は、自動で却下せず承認者の判断に回します）';
+    }
+  }
+  console.log([
+    masterReport,
+    periodReport,
+    `管理者：${CONFIG.ADMIN_EMAILS.join('、')}`,
+    `初期設定が完了しました。未処理だった申請 ${pending.applications} 件・成果報告 ${pending.results} 件を処理しました（通知なし）。`,
+    `Chatwork通知：${chatworkEnabled_() ? 'あり' : 'なし（投稿内容は実行ログに出ます）'}`,
+  ].join('\n'));
+}
+
+function addColumn_(sheet, header) {
+  if (columns_(sheet)[header]) return;
+  const c = sheet.getLastColumn() + 1;
+  if (c > sheet.getMaxColumns()) sheet.insertColumnsAfter(sheet.getMaxColumns(), c - sheet.getMaxColumns());
+  sheet.getRange(1, c).setValue(header);
 }
 
 // マスタの準備と点検。なければ見出し付きで作って止まる。あれば保護して中身を点検する
@@ -670,40 +765,20 @@ function setupMaster_(ss) {
   }
   MASTER_CACHE_ = null;
   const list = master_();
-  sh.getProtections(SpreadsheetApp.ProtectionType.SHEET).forEach(p => p.remove());
-  ownerOnly_(sh.protect().setDescription('他部門稼働：マスタ（管理者のみ編集）'));
+  sh.getProtections(SpreadsheetApp.ProtectionType.SHEET)
+    .filter(p => String(p.getDescription()).indexOf(PROTECT_PREFIX) === 0).forEach(p => p.remove());
+  ownerOnly_(sh.protect().setDescription(PROTECT_PREFIX + 'マスタ（管理者のみ編集）'));
 
   const lines = [`マスタ：${list.length}人`];
   const badRole = list.filter(p => p.role !== MASTER.APPLICANT && p.role !== MASTER.APPROVER);
   if (badRole.length) lines.push(`注意：区分が「${MASTER.APPLICANT}」「${MASTER.APPROVER}」以外の行があります（${badRole.map(p => p.name).join('、')}）`);
-  const approvers = list.filter(p => p.role === MASTER.APPROVER);
-  const honbus = approvers.map(p => p.honbu).filter((h, i, a) => h && a.indexOf(h) === i);
+  const honbus = list.filter(p => p.role === MASTER.APPROVER).map(p => p.honbu).filter((h, i, a) => h && a.indexOf(h) === i);
   lines.push(`承認者がいる本部：${honbus.join('、') || 'なし'}（申請フォームの本部の選択肢と同じ文字にしてください）`);
   const noId = list.filter(p => !/^\d+$/.test(p.cw));
   if (noId.length) lines.push(`注意：chatwork_account_ID が未入力の人（メンションなしで通知）：${noId.map(p => p.name).join('、')}`);
   const noMail = list.filter(p => !p.mail);
   if (noMail.length) lines.push(`注意：mail が未入力の人（申請者名の補完や承認の確認ができません）：${noMail.map(p => p.name).join('、')}`);
   return lines.join('\n');
-}
-
-function backfill_(sheet, cols) {
-  let count = 0;
-  withLock_(() => {
-    for (let row = 2; row <= sheet.getLastRow(); row++) {
-      const rec = readRow_(sheet, cols, row);
-      if (rec[M.ID] || !rec[F.TIMESTAMP]) continue;
-      const status = initialStatus_(rec[F.HOURS]);
-      const id = nextId_();
-      const p = personByMail_(rec[F.EMAIL], MASTER.APPLICANT);
-      writeRow_(sheet, cols, row, {
-        [M.ID]: id, [M.APPLICANT_NAME]: p ? p.name : '（マスタ未登録）',
-        [M.STATUS]: status, [M.RESULT_STATUS]: RS.NONE,
-      });
-      setStatus_(id, status);
-      count++;
-    }
-  });
-  return count;
 }
 
 function ownerOnly_(protection) {
@@ -721,29 +796,40 @@ function buildPrefilledUrl_(resultSheet) {
   return form.createResponse().withItemResponse(item.asTextItem().createResponse(ID_MARK)).toPrefilledUrl();
 }
 
-// F と R の必須項目が入力されているか確かめる
+// 設定ファイルに必要な項目がそろっているか確かめる。足りなければ、まとめて知らせる
 function checkConfig_() {
-  const missing = REQUIRED_F.filter(k => !hasF_(k)).map(k => 'F.' + k)
-    .concat(REQUIRED_R.filter(k => !String(R[k] || '').trim()).map(k => 'R.' + k));
-  if (missing.length) {
-    throw new Error(`フォームの設問名が未入力です：${missing.join('、')}。コード上部の F と R に、実際の設問名を入力してください。`);
-  }
+  const p = [];
+  REQUIRED_F.forEach(k => { if (!hasF_(k)) p.push(`F.${k}（設問名）`); });
+  REQUIRED_R.forEach(k => { if (!hasR_(k)) p.push(`R.${k}（設問名）`); });
+  if (typeof CONFIG.MAX_BUSINESS_DAYS !== 'number' || CONFIG.MAX_BUSINESS_DAYS < 0) p.push('CONFIG.MAX_BUSINESS_DAYS（稼働期間の上限の営業日。上限なしなら 0）');
+  if (typeof CONFIG.SKIP_HOLIDAYS !== 'boolean') p.push('CONFIG.SKIP_HOLIDAYS（祝日を除くなら true、除かないなら false）');
+  if (CONFIG.SKIP_HOLIDAYS === true && !String(CONFIG.HOLIDAY_CALENDAR_ID || '').trim()) p.push('CONFIG.HOLIDAY_CALENDAR_ID（祝日カレンダーのID）');
+  if (!String(CONFIG.SHEET_ERROR || '').trim()) p.push('CONFIG.SHEET_ERROR（通知エラーを記録するシートの名前）');
+  if (!Array.isArray(CONFIG.ADMIN_EMAILS) || !CONFIG.ADMIN_EMAILS.length) p.push('CONFIG.ADMIN_EMAILS（管理者のメールアドレスの一覧）');
+  if (typeof NOTIFY === 'undefined') p.push('NOTIFY（通知のオン・オフ）');
+  else KINDS.forEach(k => { if (typeof NOTIFY[k] !== 'boolean') p.push(`NOTIFY['${k}']（true か false）`); });
+  KINDS.forEach(k => { if (!Array.isArray(MENTIONS[k])) p.push(`MENTIONS['${k}']（メンション先）`); });
+  ['概要'].concat(KINDS).forEach(k => { if (!MESSAGES[k]) p.push(`MESSAGES['${k}']（文面）`); });
+  if (p.length) throw new Error('設定ファイルに次の項目がないか、書き方が違います：\n・' + p.join('\n・') + '\n設定ファイルを直してから、もう一度実行してください。');
 }
 
 function hasF_(key) { return !!String(F[key] || '').trim(); }
+function hasR_(key) { return !!String(R[key] || '').trim(); }
 function usedF_() { return Object.keys(F).filter(hasF_).map(k => F[k]); }
-function usedR_() { return Object.keys(R).filter(k => String(R[k] || '').trim()).map(k => R[k]); }
+function usedR_() { return Object.keys(R).filter(hasR_).map(k => R[k]); }
 
 
-// ===== 確認用（手動で実行。Chatworkには送らず、実行ログに出すだけ） =====
+// ===== 確認用（手動で実行） =====
 
-// Chatworkの接続確認
+// Chatworkの接続確認（※実際にChatworkに送信する）
 function testChatwork() {
   if (!chatworkEnabled_()) throw new Error('CHATWORK_TOKEN と CHATWORK_ROOM_ID が未登録です。');
-  postChatwork_('[info][title]接続テスト[/title]他部門稼働の通知テストです。[/info]');
+  const err = sendChatwork_(mentionHeader_() + '[info][title]接続テスト[/title]他部門稼働の通知テストです。[/info]');
+  if (err) throw new Error('Chatworkへの送信に失敗しました：' + err);
+  console.log('Chatworkに接続テストを送りました。');
 }
 
-// 通知先グループのメンバーとアカウントIDを表示（マスタの chatwork_account_ID を調べる用）
+// 通知先グループのメンバーとアカウントIDを表示（マスタの chatwork_account_ID を調べる用。送信はしない）
 function listChatworkMembers() {
   if (!chatworkEnabled_()) throw new Error('CHATWORK_TOKEN と CHATWORK_ROOM_ID が未登録です。');
   const p = PropertiesService.getScriptProperties();
@@ -756,7 +842,7 @@ function listChatworkMembers() {
   console.log('アカウントID　名前\n' + lines.join('\n'));
 }
 
-// マスタの人を使ったサンプルで、全種類の文面を確認する
+// マスタの人を使ったサンプルで、全種類の文面を実行ログに出す（送信はしない。オフの通知は空で出る）
 function previewMessages() {
   checkConfig_();
   const list = master_();
@@ -771,12 +857,12 @@ function previewMessages() {
     [F.MEMBER]: '山田太郎',
     [F.START]: new Date(2026, 10, 2),
     [F.END]: new Date(2026, 10, 6),
-    [F.HOURS]: 20,
     [M.ID]: 'W0000',
+    [M.APPLICANT_NAME]: applicant.name,
     [M.STATUS]: S.APPROVED,
     [M.APPROVER]: approver ? approver.mail : 'approver@example.com',
-    [M.REASON]: '今週は納期が重なっているため',
-    [M.ACTUAL]: 18,
+    [M.REASON]: (CONFIG.REASON_CHOICES || [])[0] || '稼働期間の誤り',
+    [M.ACTUAL]: 4,
     [M.RESULT]: '提案が通り、受注見込み200万円',
   };
   if (hasF_('TARGET_HONBU')) rec[F.TARGET_HONBU] = other ? other.honbu : '制作本部';
@@ -785,11 +871,11 @@ function previewMessages() {
   const t = MESSAGES['督促'];
   [
     ['承認依頼', () => message_('承認依頼', rec, { 'シートのリンク': link, '注意書き': applicationNotes_(rec) })],
-    ['承認不要の届出', () => message_('承認不要', rec, { '注意書き': applicationNotes_(rec) })],
     ['承認', () => message_('承認', rec)],
     ['却下', () => message_('却下', rec)],
+    ['修正', () => message_('修正', rec)],
     ['成果報告', () => message_('成果報告', rec)],
-    ['督促（1件の例）', () => mentionText_(recipients_(rec, MENTIONS['督促'] || [])) +
+    ['督促（1件の例）', () => mentionText_(recipients_(rec, MENTIONS['督促'])) +
       `[info][title]${fill_(t['タイトル'], {}, { '件数': 1 })}[/title]${fill_(t['前置き'], {}, { '件数': 1 })}\n\n` +
       fill_(t['行'], rec) + '[/info]'],
   ].forEach(([name, build]) => {
@@ -798,7 +884,7 @@ function previewMessages() {
   });
 }
 
-// 申請回答シートの一番下の申請で、マスタとの対応と、実際に送られる文面を確認する
+// 申請回答シートの一番下の申請で、マスタとの対応と、実際に送られる文面を確認する（送信はしない）
 function checkLatestApplication() {
   checkConfig_();
   const sheet = applySheet_();
@@ -824,16 +910,12 @@ function checkLatestApplication() {
     out.push(tp.length ? `OK　稼働先の承認者：「${honbuName_(rec[F.TARGET_HONBU])}」→ ${names_(tp)}`
       : `NG　稼働先の承認者：「${honbuName_(rec[F.TARGET_HONBU])}」の承認者がマスタにいません`);
   }
-  [['START', '開始日'], ['END', '終了日']].forEach(([k, label]) => {
-    out.push(rec[F[k]] instanceof Date ? `OK　${label}：日付として入っています`
-      : `NG　${label}：「${rec[F[k]]}」は日付ではありません（督促が動きません）`);
-  });
-  out.push(/^\s*\d+(\.\d+)?\s*$/.test(String(rec[F.HOURS])) ? `OK　予定時間：${rec[F.HOURS]}`
-    : `NG　予定時間：「${rec[F.HOURS]}」は数字だけではありません`);
+  const period = periodCheck_(rec);
+  out.push(period.reject ? `NG　稼働期間：${period.reject}` : `OK　稼働期間${period.note ? '：' + period.note.replace(/\n/g, '') : ''}`);
 
   out.push('', '■3 この申請で実際に送られる文面');
   [
-    ['承認依頼', () => message_('承認依頼', rec, { 'シートのリンク': rowLink_(sheet, row, cols[M.STATUS]), '注意書き': applicationNotes_(rec) })],
+    ['承認依頼', () => message_('承認依頼', rec, { 'シートのリンク': rowLink_(sheet, row, cols[M.STATUS]), '注意書き': applicationNotes_(rec) + period.note })],
     ['承認', () => message_('承認', rec)],
   ].forEach(([name, build]) => {
     try { out.push(`----- ${name} -----`, build()); }
@@ -896,10 +978,15 @@ function resultUrl_(id) {
 }
 
 // 承認ステータスの正しい値は、シートとは別にスクリプト プロパティにも持つ（勝手な書き換えを元に戻すため）
+// ※ スクリプト プロパティの「ST:管理ID」は消さないこと
 function currentStatus_(id, rec) {
-  const v = PropertiesService.getScriptProperties().getProperty('ST:' + id);
+  const v = storedStatus_(id);
   if (v !== null) return v;
   return rec[M.APPROVED_AT] ? String(rec[M.STATUS]) : S.PENDING;
+}
+
+function storedStatus_(id) {
+  return PropertiesService.getScriptProperties().getProperty('ST:' + id);
 }
 
 function setStatus_(id, value) {
@@ -911,20 +998,6 @@ function nextId_() {
   const seq = Number(p.getProperty('SEQ') || 0) + 1;
   p.setProperty('SEQ', String(seq));
   return 'W' + String(seq).padStart(4, '0');
-}
-
-function isAdmin_(email) {
-  const owner = Session.getEffectiveUser().getEmail();
-  return !!email && !!owner && email.toLowerCase() === owner.toLowerCase();
-}
-
-function firstTime_(key) {
-  return withLock_(() => {
-    const cache = CacheService.getScriptCache();
-    if (cache.get(key)) return false;
-    cache.put(key, '1', 21600);
-    return true;
-  });
 }
 
 function withLock_(fn) {
