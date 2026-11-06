@@ -1,0 +1,90 @@
+// ===== 初期設定（手動で実行。何度実行してもよい） =====
+function setup() {
+  checkConfig_();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const masterReport = setupMaster_(ss);
+
+  const apply = ss.getSheetByName(CONFIG.SHEET_APPLY);
+  const result = ss.getSheetByName(CONFIG.SHEET_RESULT);
+  if (!apply || !result) {
+    throw new Error(`シート「${CONFIG.SHEET_APPLY}」と「${CONFIG.SHEET_RESULT}」が必要です。フォームの回答先をこのスプレッドシートにし、回答シートの名前を変更してください。`);
+  }
+  requireCols_(columns_(apply), usedF_(), 'F に入力した設問名が、申請回答シートの1行目と一致しているか確認してください。');
+  requireCols_(columns_(result), usedR_(), 'R に入力した設問名が、成果回答シートの1行目と一致しているか確認してください。');
+  const clash = usedF_().filter(h => M_ORDER.indexOf(h) >= 0);
+  if (clash.length) throw new Error(`フォームの設問名と管理列の名前が同じです（${clash.join('、')}）。設問名を変えてください。`);
+
+  // 以前の版の列名を、今の列名に書き換える
+  Object.keys(RENAMED).forEach(oldName => {
+    const c = columns_(apply);
+    if (c[oldName] && !c[RENAMED[oldName]]) apply.getRange(1, c[oldName]).setValue(RENAMED[oldName]);
+  });
+  // 管理列を右端に追加
+  M_ORDER.forEach(h => addColumn_(apply, h));
+  // 成果回答シートに「処理結果（自動）」列を追加。以前からある回答は、以前の版で処理済みとして印を付ける
+  if (!columns_(result)[RM.RESULT]) {
+    addColumn_(result, RM.RESULT);
+    const rc = columns_(result)[RM.RESULT];
+    const last = result.getLastRow();
+    if (last >= 2) result.getRange(2, rc, last - 1, 1).setValue('以前の版で処理済み');
+  }
+
+  const cols = columns_(apply);
+  if (apply.getMaxRows() < CONFIG.PREPARED_ROWS) {
+    apply.insertRowsAfter(apply.getMaxRows(), CONFIG.PREPARED_ROWS - apply.getMaxRows());
+  }
+  const n = apply.getMaxRows() - 1;
+  apply.getRange(1, 1, 1, apply.getLastColumn()).setFontWeight('bold');
+  apply.setFrozenRows(1);
+  apply.getRange(2, cols[M.STATUS], n, 1).setDataValidation(
+    SpreadsheetApp.newDataValidation().requireValueInList([S.PENDING].concat(DECISIONS), true).setAllowInvalid(false).build());
+  // 理由の列：よく使う理由を一覧から選べるようにする（一覧にない文も入力できる）
+  const choices = (CONFIG.REASON_CHOICES || []).filter(x => String(x).trim());
+  apply.getRange(2, cols[M.REASON], n, 1).setDataValidation(choices.length
+    ? SpreadsheetApp.newDataValidation().requireValueInList(choices, true).setAllowInvalid(true).build()
+    : null);
+  [M.APPROVED_AT, M.REPORTED_AT].forEach(h => apply.getRange(2, cols[h], n, 1).setNumberFormat('yyyy/mm/dd hh:mm'));
+
+  // setup より前に届いていた申請に管理IDを振る（通知はしない）
+  const pending = reprocessPending_(false);
+
+  // 保護：このGASが付けた保護だけを作り直す
+  //   申請回答は「承認ステータス」「理由」だけ編集可。成果回答・通知エラーは管理者のみ
+  const es = errorSheet_();
+  [apply, result, es].forEach(sh => sh.getProtections(SpreadsheetApp.ProtectionType.SHEET)
+    .filter(p => String(p.getDescription()).indexOf(PROTECT_PREFIX) === 0).forEach(p => p.remove()));
+  const pa = apply.protect().setDescription(PROTECT_PREFIX + '承認ステータスと理由以外は編集不可');
+  pa.setUnprotectedRanges([apply.getRange(2, cols[M.STATUS], n, 1), apply.getRange(2, cols[M.REASON], n, 1)]);
+  ownerOnly_(pa);
+  ownerOnly_(result.protect().setDescription(PROTECT_PREFIX + '成果報告フォームの回答（編集不可）'));
+  ownerOnly_(es.protect().setDescription(PROTECT_PREFIX + '通知エラーの記録（管理者のみ編集）'));
+
+  // 成果報告フォームの「管理ID入力済みURL」
+  PropertiesService.getScriptProperties().setProperty('RESULT_FORM_URL', buildPrefilledUrl_(result));
+
+  // トリガー（重複しないよう作り直す。トリガーは実行した人のものになるので、いつも同じアカウントで実行する）
+  const handlers = ['handleFormSubmit', 'handleEdit', 'dailyReminder'];
+  ScriptApp.getProjectTriggers().forEach(t => { if (handlers.indexOf(t.getHandlerFunction()) >= 0) ScriptApp.deleteTrigger(t); });
+  ScriptApp.newTrigger('handleFormSubmit').forSpreadsheet(ss).onFormSubmit().create();
+  ScriptApp.newTrigger('handleEdit').forSpreadsheet(ss).onEdit().create();
+  ScriptApp.newTrigger('dailyReminder').timeBased().everyDays(1).atHour(CONFIG.REMIND_HOUR).create();
+
+  // 稼働期間の上限と、祝日カレンダーの確認（初回はカレンダーの権限の承認を求められる）
+  let periodReport = '稼働期間の上限：なし';
+  if (Number(CONFIG.MAX_BUSINESS_DAYS) > 0) {
+    periodReport = `稼働期間の上限：${CONFIG.MAX_BUSINESS_DAYS}営業日`;
+    if (CONFIG.SKIP_HOLIDAYS) {
+      const y = new Date().getFullYear();
+      const h = holidays_(new Date(y, 0, 1), new Date(y, 11, 31));
+      periodReport += h.ok ? `（祝日を除く。今年の祝日 ${Object.keys(h.set).length} 日を読み込めました）`
+        : '（祝日カレンダーを読めません。上限を超える申請は、自動で却下せず承認者の判断に回します）';
+    }
+  }
+  console.log([
+    masterReport,
+    periodReport,
+    `管理者：${CONFIG.ADMIN_EMAILS.join('、')}`,
+    `初期設定が完了しました。未処理だった申請 ${pending.applications} 件・成果報告 ${pending.results} 件を処理しました（通知なし）。`,
+    `Chatwork通知：${chatworkEnabled_() ? 'あり' : 'なし（投稿内容は実行ログに出ます）'}`,
+  ].join('\n'));
+}
